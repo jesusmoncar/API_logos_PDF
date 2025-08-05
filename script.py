@@ -10,6 +10,7 @@ import logging
 from pathlib import Path
 import argparse
 import pickle
+import re
 from scipy.spatial.distance import cosine
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
@@ -40,7 +41,25 @@ KEYWORDS_TO_REMOVE = [
 
 TEXT_BLOCKS_TO_REMOVE = [
     "Ayuda y soporte", "¿Tienes alguna pregunta", "support.tiqets.com",
-    "estrictamente personal", "contacto", "soporte técnico"
+    "estrictamente personal", "contacto", "soporte técnico","TIQETS INTERNATIONAL B.V.",
+    "civitatis", "(https://www.civitatis.com/es/privacidad/)", "Generado por Tiqets",
+]
+
+# Patrones de URLs y enlaces para detectar
+URL_PATTERNS = [
+    r'https?://[^\s<>"{}|\\^`\[\]]+',  # URLs HTTP/HTTPS
+    r'www\.[^\s<>"{}|\\^`\[\]]+',      # URLs que empiezan con www
+    r'[a-zA-Z0-9.-]+\.(com|org|net|edu|gov|mil|int|co|uk|es|fr|de|it|ru|cn|jp|au|ca)\b[^\s]*',  # Dominios comunes
+    r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',  # Emails
+    r'tel:\+?[0-9\s\-\(\)]+',          # Enlaces telefónicos
+    r'mailto:[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',  # Enlaces mailto
+]
+
+# Dominios específicos a eliminar
+DOMAINS_TO_REMOVE = [
+    "tiqets.com", "support.tiqets.com", "civitatis.com", "viator.com", 
+    "getyourguide.com", "tripadvisor.com", "booking.com", "expedia.com",
+    "ticketmaster.com", "eventbrite.com", "stubhub.com"
 ]
 
 class LogoDataset(Dataset):
@@ -147,6 +166,166 @@ class OCRDetector:
             logger.error(f"Error en OCR: {e}")
             
         return result
+
+class LinkDetector:
+    """Detector y eliminador de enlaces en PDFs."""
+    
+    def __init__(self):
+        # Compilar patrones regex para eficiencia
+        self.url_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in URL_PATTERNS]
+        self.domains_to_remove = DOMAINS_TO_REMOVE
+        
+    def detect_links_in_text(self, text: str) -> List[Dict]:
+        """
+        Detecta enlaces en un texto dado.
+        """
+        links_found = []
+        
+        for pattern in self.url_patterns:
+            matches = pattern.finditer(text)
+            for match in matches:
+                link_info = {
+                    'text': match.group(),
+                    'start': match.start(),
+                    'end': match.end(),
+                    'type': self._classify_link_type(match.group())
+                }
+                links_found.append(link_info)
+        
+        # Verificar dominios específicos
+        for domain in self.domains_to_remove:
+            if domain.lower() in text.lower():
+                # Buscar contexto del dominio
+                domain_pattern = re.compile(rf'\S*{re.escape(domain)}\S*', re.IGNORECASE)
+                matches = domain_pattern.finditer(text)
+                for match in matches:
+                    link_info = {
+                        'text': match.group(),
+                        'start': match.start(),
+                        'end': match.end(),
+                        'type': 'domain_specific'
+                    }
+                    links_found.append(link_info)
+        
+        return links_found
+    
+    def _classify_link_type(self, link_text: str) -> str:
+        """Clasifica el tipo de enlace."""
+        link_lower = link_text.lower()
+        
+        if link_lower.startswith(('http://', 'https://')):
+            return 'url_http'
+        elif link_lower.startswith('www.'):
+            return 'url_www'
+        elif link_lower.startswith('mailto:'):
+            return 'email_mailto'
+        elif link_lower.startswith('tel:'):
+            return 'phone_tel'
+        elif '@' in link_text and '.' in link_text:
+            return 'email'
+        elif any(tld in link_lower for tld in ['.com', '.org', '.net', '.edu']):
+            return 'domain'
+        else:
+            return 'unknown'
+    
+    def remove_link_annotations(self, page) -> int:
+        """
+        Elimina anotaciones de enlaces (clickeables) de una página PDF.
+        """
+        removed_count = 0
+        
+        try:
+            # Obtener todas las anotaciones de la página
+            annotations = page.annots()
+            
+            for annot in annotations:
+                try:
+                    annot_dict = annot.info
+                    annot_type = annot_dict.get('content', '')
+                    
+                    # Verificar si es una anotación de enlace
+                    if (annot.type[1] == 'Link' or 
+                        'uri' in annot_dict or 
+                        any(domain in str(annot_dict).lower() for domain in self.domains_to_remove)):
+                        
+                        # Eliminar la anotación
+                        page.delete_annot(annot)
+                        removed_count += 1
+                        logger.debug(f"Eliminada anotación de enlace: {annot_dict}")
+                        
+                except Exception as e:
+                    logger.warning(f"Error procesando anotación: {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Error eliminando anotaciones de enlaces: {e}")
+        
+        return removed_count
+    
+    def remove_links_from_text_blocks(self, page, aggressive: bool = False) -> int:
+        """
+        Elimina texto que contiene enlaces de los bloques de texto de la página.
+        """
+        removed_count = 0
+        
+        try:
+            # Método 1: Buscar bloques de texto con enlaces
+            blocks = page.get_text("blocks")
+            
+            for block in blocks:
+                if len(block) >= 5:
+                    x0, y0, x1, y1, text = block[:5]
+                    
+                    # Detectar enlaces en el texto
+                    links_found = self.detect_links_in_text(text)
+                    
+                    if links_found:
+                        # Si aggressive=True, elimina todo el bloque
+                        if aggressive:
+                            rect = fitz.Rect(x0, y0, x1, y1)
+                            page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), width=0)
+                            removed_count += 1
+                            logger.info(f"LINK Eliminado bloque con enlaces: '{text[:50]}...'")
+                        else:
+                            # Eliminar solo las partes con enlaces
+                            for link in links_found:
+                                # Buscar la posición específica del enlace
+                                link_instances = page.search_for(link['text'])
+                                for inst in link_instances:
+                                    expanded_rect = fitz.Rect(
+                                        inst.x0 - 2, inst.y0 - 1,
+                                        inst.x1 + 2, inst.y1 + 1
+                                    )
+                                    page.draw_rect(expanded_rect, color=(1, 1, 1), fill=(1, 1, 1), width=0)
+                                    removed_count += 1
+                                    logger.info(f"LINK Eliminado enlace: '{link['text']}'")
+            
+            # Método 2: Buscar enlaces específicos por patrón
+            for pattern in self.url_patterns:
+                # Buscar texto que coincida con patrones de URL
+                text_dict = page.get_text("dict")
+                for block in text_dict.get("blocks", []):
+                    if "lines" in block:
+                        for line in block["lines"]:
+                            for span in line.get("spans", []):
+                                span_text = span.get("text", "")
+                                if pattern.search(span_text):
+                                    # Crear rectángulo para el span
+                                    bbox = span.get("bbox")
+                                    if bbox:
+                                        rect = fitz.Rect(bbox)
+                                        expanded_rect = fitz.Rect(
+                                            rect.x0 - 2, rect.y0 - 1,
+                                            rect.x1 + 2, rect.y1 + 1
+                                        )
+                                        page.draw_rect(expanded_rect, color=(1, 1, 1), fill=(1, 1, 1), width=0)
+                                        removed_count += 1
+                                        logger.info(f"LINK Eliminado texto con patrón URL: '{span_text[:30]}...'")
+                                        
+        except Exception as e:
+            logger.error(f"Error eliminando enlaces de texto: {e}")
+        
+        return removed_count
 
 class TrainingDataAnalyzer:
     """Analizador que extrae características específicas de los datos de entrenamiento."""
@@ -477,6 +656,7 @@ class AdvancedPDFLogoRemover:
         self.ocr_detector = OCRDetector()
         self.inpainter = InpaintingProcessor()
         self.training_analyzer = TrainingDataAnalyzer(training_data_dir)
+        self.link_detector = LinkDetector()
         
         # Inicializar analizador de datos de entrenamiento
         logger.info("Inicializando analizador de datos de entrenamiento...")
@@ -1056,9 +1236,57 @@ class AdvancedPDFLogoRemover:
         
         return removed_count
     
+    def remove_links(self, doc, aggressive: bool = False) -> Dict:
+        """
+        Elimina enlaces del documento PDF.
+        """
+        stats = {
+            'total_link_annotations_removed': 0,
+            'total_link_text_removed': 0,
+            'pages_processed': 0,
+            'details': []
+        }
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            page_stats = {
+                'page_number': page_num + 1,
+                'link_annotations_removed': 0,
+                'link_text_removed': 0
+            }
+            
+            try:
+                # Eliminar anotaciones de enlaces (clickeables)
+                annotations_removed = self.link_detector.remove_link_annotations(page)
+                page_stats['link_annotations_removed'] = annotations_removed
+                stats['total_link_annotations_removed'] += annotations_removed
+                
+                # Eliminar texto con enlaces
+                text_removed = self.link_detector.remove_links_from_text_blocks(page, aggressive)
+                page_stats['link_text_removed'] = text_removed
+                stats['total_link_text_removed'] += text_removed
+                
+                if annotations_removed > 0 or text_removed > 0:
+                    logger.info(f"LINK Página {page_num + 1}: {annotations_removed} anotaciones, {text_removed} textos con enlaces eliminados")
+                
+                stats['details'].append(page_stats)
+                stats['pages_processed'] += 1
+                
+            except Exception as e:
+                logger.error(f"Error eliminando enlaces en página {page_num + 1}: {e}")
+                continue
+        
+        total_removed = stats['total_link_annotations_removed'] + stats['total_link_text_removed']
+        if total_removed > 0:
+            logger.info(f"LINK Total enlaces eliminados: {stats['total_link_annotations_removed']} anotaciones + {stats['total_link_text_removed']} texto = {total_removed}")
+        
+        return stats
+    
     def process_pdf(self, input_path: str, output_path: str, 
                    confidence_threshold: float = 0.5,
                    remove_text_blocks_flag: bool = True,
+                   remove_links_flag: bool = True,
+                   aggressive_link_removal: bool = False,
                    text_keywords: List[str] = None) -> Dict:
         """
         Procesa un PDF completo eliminando logos y texto específico.
@@ -1072,6 +1300,9 @@ class AdvancedPDFLogoRemover:
             'logos_detected': 0,
             'logos_removed': 0,
             'text_blocks_removed': 0,
+            'links_removed': 0,
+            'link_annotations_removed': 0,
+            'link_text_removed': 0,
             'processing_details': []
         }
         
@@ -1087,7 +1318,15 @@ class AdvancedPDFLogoRemover:
                 text_removed = self.remove_text_blocks(doc, keywords)
                 stats['text_blocks_removed'] = text_removed
             
-            # Paso 2: Procesar imágenes y logos
+            # Paso 2: Eliminar enlaces
+            if remove_links_flag:
+                logger.info("LINK Eliminando enlaces del documento...")
+                link_stats = self.remove_links(doc, aggressive_link_removal)
+                stats['link_annotations_removed'] = link_stats['total_link_annotations_removed']
+                stats['link_text_removed'] = link_stats['total_link_text_removed']
+                stats['links_removed'] = stats['link_annotations_removed'] + stats['link_text_removed']
+            
+            # Paso 3: Procesar imágenes y logos
             logger.info("SEARCH Analizando imágenes y logos...")
             
             for page_num in range(len(doc)):
@@ -1181,6 +1420,8 @@ class AdvancedPDFLogoRemover:
     def process_pdf_batch(self, input_dir: str = "pdf", output_dir: str = "pdfModificado",
                          confidence_threshold: float = 0.5,
                          remove_text_blocks_flag: bool = True,
+                         remove_links_flag: bool = True,
+                         aggressive_link_removal: bool = False,
                          text_keywords: List[str] = None) -> Dict:
         """
         Procesa todos los PDFs de una carpeta y los guarda en otra carpeta.
@@ -1229,6 +1470,8 @@ class AdvancedPDFLogoRemover:
                     str(output_file),
                     confidence_threshold=confidence_threshold,
                     remove_text_blocks_flag=remove_text_blocks_flag,
+                    remove_links_flag=remove_links_flag,
+                    aggressive_link_removal=aggressive_link_removal,
                     text_keywords=text_keywords
                 )
                 
@@ -1382,6 +1625,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=10, help="Épocas de entrenamiento")
     parser.add_argument("--extract-candidates", action="store_true", help="Extraer imágenes candidatas en lugar de procesar PDF")
     parser.add_argument("--candidates_dir", default="candidates", help="Carpeta donde guardar candidatos extraídos")
+    parser.add_argument("--remove-links", action="store_true", help="Eliminar enlaces y URLs del PDF")
+    parser.add_argument("--aggressive-links", action="store_true", help="Eliminación agresiva de enlaces (incluye texto con URLs)")
     
     args = parser.parse_args()
     
@@ -1471,6 +1716,8 @@ def main():
                     output_dir=args.output_dir,
                     confidence_threshold=effective_threshold,
                     remove_text_blocks_flag=not args.no_text,
+                    remove_links_flag=args.remove_links,
+                    aggressive_link_removal=args.aggressive_links,
                     text_keywords=custom_keywords
                 )
             else:
@@ -1481,6 +1728,8 @@ def main():
                     args.output,
                     confidence_threshold=effective_threshold,
                     remove_text_blocks_flag=not args.no_text,
+                    remove_links_flag=args.remove_links,
+                    aggressive_link_removal=args.aggressive_links,
                     text_keywords=custom_keywords
                 )
         
@@ -1525,12 +1774,15 @@ def main():
             total_images = sum(f.get('total_images', 0) for f in stats['files_details'])
             total_logos_detected = sum(f.get('logos_detected', 0) for f in stats['files_details'])
             total_logos_removed = sum(f.get('logos_removed', 0) for f in stats['files_details'])
+            total_links_removed = sum(f.get('links_removed', 0) for f in stats['files_details'])
             
             print(f"PAGE Total páginas procesadas: {total_pages}")
             print(f"CLEAN Total bloques de texto eliminados: {total_text_removed}")
             print(f"IMAGE Total imágenes analizadas: {total_images}")
             print(f"INFO Total logos detectados: {total_logos_detected}")
             print(f"REMOVE Total logos eliminados: {total_logos_removed}")
+            if args.remove_links:
+                print(f"LINK Total enlaces eliminados: {total_links_removed}")
             print(f"SAVE Archivos guardados en: {args.output_dir}")
             
             # Mostrar detalles por archivo
@@ -1555,6 +1807,8 @@ def main():
             print(f"IMAGE Imágenes analizadas: {stats['total_images']}")
             print(f"INFO Logos detectados: {stats['logos_detected']}")
             print(f"REMOVE Logos eliminados: {stats['logos_removed']}")
+            if args.remove_links:
+                print(f"LINK Enlaces eliminados: {stats.get('links_removed', 0)}")
             print(f"SAVE Archivo generado: {args.output}")
             
             # Detalles por página (modo individual)
