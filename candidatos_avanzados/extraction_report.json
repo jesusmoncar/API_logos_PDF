@@ -1,0 +1,83 @@
+{
+  "total_pages": 1,
+  "total_images": 5,
+  "logo_candidates": 1,
+  "no_logo_candidates": 4,
+  "extracted_files": [
+    {
+      "filename": "page1_img0_logo_candidate_1.00.png",
+      "page": 1,
+      "image_index": 0,
+      "classification": "logo_candidate",
+      "confidence": 1,
+      "size": [
+        800,
+        303
+      ],
+      "ml_confidence": 0.7765659093856812,
+      "similarity_confidence": 1,
+      "has_text": true,
+      "text_content": "Tiqets_ "
+    },
+    {
+      "filename": "page1_img1_no_logo_candidate_0.54.png",
+      "page": 1,
+      "image_index": 1,
+      "classification": "no_logo_candidate",
+      "confidence": 0.5399185682013387,
+      "size": [
+        499,
+        410
+      ],
+      "ml_confidence": 0.7740468978881836,
+      "similarity_confidence": 0.4397052498493472,
+      "has_text": true,
+      "text_content": "M Musée 0 d'Orsay "
+    },
+    {
+      "filename": "page1_img2_no_logo_candidate_0.65.png",
+      "page": 1,
+      "image_index": 2,
+      "classification": "no_logo_candidate",
+      "confidence": 0.6498443472385407,
+      "size": [
+        32,
+        32
+      ],
+      "ml_confidence": 0.7749980092048645,
+      "similarity_confidence": 0,
+      "has_text": false,
+      "text_content": ""
+    },
+    {
+      "filename": "page1_img3_no_logo_candidate_0.75.png",
+      "page": 1,
+      "image_index": 3,
+      "classification": "no_logo_candidate",
+      "confidence": 0.7533154571056366,
+      "size": [
+        775,
+        259
+      ],
+      "ml_confidence": 0.7889484763145447,
+      "similarity_confidence": 0,
+      "has_text": false,
+      "text_content": ""
+    },
+    {
+      "filename": "page1_img4_no_logo_candidate_0.75.png",
+      "page": 1,
+      "image_index": 4,
+      "classification": "no_logo_candidate",
+      "confidence": 0.7535234892368317,
+      "size": [
+        20,
+        20
+      ],
+      "ml_confidence": 0.7882550358772278,
+      "similarity_confidence": 0,
+      "has_text": false,
+      "text_content": ""
+    }
+  ]
+}

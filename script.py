@@ -1,14 +1,18 @@
 import fitz  # PyMuPDF
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 import io
 import os
-import pickle
 import json
 from typing import List, Tuple, Dict, Optional
 import logging
 from pathlib import Path
+import argparse
+import pickle
+from scipy.spatial.distance import cosine
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
 # ML y Deep Learning
 import torch
@@ -20,122 +24,24 @@ from torchvision.models import resnet18
 from sklearn.model_selection import train_test_split
 
 # OCR
-import re
 import easyocr
-from PIL import ImageDraw
-
-# Inpainting
-from scipy import ndimage
-from skimage import restoration, morphology
-from skimage.segmentation import flood_fill
-
-import argparse
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--data_dir", type=str, default="training_data", help="Ruta a las imágenes")
-args = parser.parse_args()
-
-data_dir = args.data_dir
 
 # Configurar logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Definir palabras clave para eliminar texto sensible
 KEYWORDS_TO_REMOVE = [
-    "Ayuda y soporte",
-    "¿Tienes alguna pregunta",
-    "support.tiqets.com",
-    "estrictamente personal",
-    "logo", "brand", "company", "corp", "inc", "ltd", "sa", "sl",
-    "trademark", "copyright", "©", "®", "™", "marca", "empresa"
+    "Ayuda y soporte", "¿Tienes alguna pregunta", "support.tiqets.com",
+    "estrictamente personal", "logo", "brand", "company", "corp", 
+    "inc", "ltd", "sa", "sl", "trademark", "copyright", "©", "®", "™", 
+    "marca", "empresa", "contacto", "soporte técnico"
 ]
 
-# Definir fragmentos clave del texto que quieres eliminar
 TEXT_BLOCKS_TO_REMOVE = [
-    "Ayuda y soporte",
-    "¿Tienes alguna pregunta",
-    "support.tiqets.com",
-    "estrictamente personal",
+    "Ayuda y soporte", "¿Tienes alguna pregunta", "support.tiqets.com",
+    "estrictamente personal", "contacto", "soporte técnico"
 ]
-
-reader = easyocr.Reader(['en', 'es', 'fr', 'de', 'it'])  # idiomas que quieras soportar
-
-def remove_text_blocks(pdf_path: str, output_path: str, keywords: List[str] = None) -> int:
-    """
-    Elimina bloques de texto específicos basados en palabras clave.
-    
-    Args:
-        pdf_path: Ruta del PDF de entrada
-        output_path: Ruta del PDF de salida
-        keywords: Lista de palabras clave a eliminar
-    
-    Returns:
-        Número de bloques eliminados
-    """
-    if keywords is None:
-        keywords = TEXT_BLOCKS_TO_REMOVE
-    
-    doc = fitz.open(pdf_path)
-    removed_count = 0
-    
-    logger.info(f"Eliminando bloques de texto con palabras clave: {keywords}")
-    
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        blocks = page.get_text("blocks")  # Extrae bloques de texto
-        
-        for block in blocks:
-            x0, y0, x1, y1, text, *_ = block
-            lower_text = text.lower()
-            
-            if any(keyword.lower() in lower_text for keyword in keywords):
-                # Dibuja un rectángulo blanco encima del texto
-                rect = fitz.Rect(x0, y0, x1, y1)
-                page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1))  # Blanco
-                removed_count += 1
-                logger.info(f"Eliminado bloque en página {page_num + 1}: '{text[:50]}...'")
-    
-    # Guardar PDF modificado
-    doc.save(output_path)
-    doc.close()
-    
-    logger.info(f"✅ Eliminados {removed_count} bloques de texto en '{output_path}'")
-    return removed_count
-
-def remove_sensitive_text_regions(image: Image.Image, keywords: List[str] = None) -> Image.Image:
-    """
-    Elimina regiones de texto sensible usando OCR.
-    
-    Args:
-        image: Imagen PIL a procesar
-        keywords: Lista de palabras clave a eliminar
-    
-    Returns:
-        Imagen con texto sensible eliminado
-    """
-    if keywords is None:
-        keywords = KEYWORDS_TO_REMOVE
-    
-    np_image = np.array(image)
-    results = reader.readtext(np_image)
-
-    draw = ImageDraw.Draw(image)
-    removed_count = 0
-
-    for (bbox, text, confidence) in results:
-        text_lower = text.lower()
-        if any(re.search(rf"\b{kw.lower()}\b", text_lower) for kw in keywords):
-            # Eliminar la región del texto
-            top_left = bbox[0]
-            bottom_right = bbox[2]
-            draw.rectangle([top_left, bottom_right], fill="white")
-            removed_count += 1
-
-    if removed_count:
-        logger.info(f"🧽 Se eliminaron {removed_count} bloques de texto sensible con OCR")
-
-    return image
 
 class LogoDataset(Dataset):
     """Dataset personalizado para entrenar el detector de logos."""
@@ -149,23 +55,31 @@ class LogoDataset(Dataset):
         return len(self.image_paths)
     
     def __getitem__(self, idx):
-        image_path = self.image_paths[idx]
-        image = Image.open(image_path).convert('RGB')
-        label = self.labels[idx]
-        
-        if self.transform:
-            image = self.transform(image)
+        try:
+            image_path = self.image_paths[idx]
+            image = Image.open(image_path).convert('RGB')
+            label = self.labels[idx]
             
-        return image, label
+            if self.transform:
+                image = self.transform(image)
+                
+            return image, label
+        except Exception as e:
+            logger.error(f"Error cargando imagen {self.image_paths[idx]}: {e}")
+            # Retornar una imagen en blanco como fallback
+            blank_image = torch.zeros(3, 224, 224)
+            return blank_image, self.labels[idx]
 
 class LogoDetectorCNN(nn.Module):
     """Red neuronal convolucional para detectar logos."""
     
     def __init__(self, num_classes: int = 2):
         super(LogoDetectorCNN, self).__init__()
-        # Usar ResNet18 preentrenado como backbone
         self.backbone = resnet18(pretrained=True)
-        # Modificar la última capa para nuestras clases
+        # Congelar las primeras capas para transfer learning
+        for param in list(self.backbone.parameters())[:-10]:
+            param.requires_grad = False
+        # Modificar la última capa
         self.backbone.fc = nn.Linear(self.backbone.fc.in_features, num_classes)
         
     def forward(self, x):
@@ -174,21 +88,17 @@ class LogoDetectorCNN(nn.Module):
 class OCRDetector:
     """Detector de texto usando OCR para identificar logos con texto."""
     
-    def __init__(self, use_easyocr: bool = True):
-        self.use_easyocr = use_easyocr
-        if use_easyocr:
-            self.reader = easyocr.Reader(['es', 'en'])  # Español e Inglés
+    def __init__(self):
+        try:
+            self.reader = easyocr.Reader(['es', 'en'], gpu=False)
+            logger.info("OCR EasyOCR inicializado correctamente")
+        except Exception as e:
+            logger.error(f"Error inicializando OCR: {e}")
+            self.reader = None
     
     def detect_text_in_logo(self, image: np.ndarray, logo_keywords: List[str] = None) -> Dict:
         """
         Detecta texto en una imagen y determina si contiene palabras clave de logos.
-        
-        Args:
-            image: Imagen en formato numpy array
-            logo_keywords: Lista de palabras clave que indican logos
-            
-        Returns:
-            Diccionario con información del texto detectado
         """
         if logo_keywords is None:
             logo_keywords = KEYWORDS_TO_REMOVE
@@ -201,13 +111,19 @@ class OCRDetector:
             'text_boxes': []
         }
         
+        if self.reader is None:
+            return result
+        
         try:
-            if self.use_easyocr:
-                # Usar EasyOCR
-                detections = self.reader.readtext(image)
-                
-                for detection in detections:
-                    bbox, text, confidence = detection
+            # Asegurar que la imagen esté en el formato correcto
+            if len(image.shape) == 3 and image.shape[2] > 3:
+                image = image[:, :, :3]  # Solo RGB
+            
+            detections = self.reader.readtext(image)
+            
+            for detection in detections:
+                if len(detection) >= 3:
+                    bbox, text, confidence = detection[0], detection[1], detection[2]
                     result['text_content'] += text + ' '
                     result['text_boxes'].append({
                         'bbox': bbox,
@@ -224,83 +140,318 @@ class OCRDetector:
             text_lower = result['text_content'].lower()
             result['is_logo_text'] = any(keyword.lower() in text_lower for keyword in logo_keywords)
             
+            if result['has_text']:
+                logger.debug(f"Texto detectado: '{result['text_content'][:100]}...', es_logo: {result['is_logo_text']}")
+                
         except Exception as e:
             logger.error(f"Error en OCR: {e}")
             
         return result
 
+class TrainingDataAnalyzer:
+    """Analizador que extrae características específicas de los datos de entrenamiento."""
+    
+    def __init__(self, training_dir: str = "training_data"):
+        self.training_dir = Path(training_dir)
+        self.logo_features = []
+        self.no_logo_features = []
+        self.feature_scaler = StandardScaler()
+        self.logo_histograms = []
+        self.no_logo_histograms = []
+        self.is_initialized = False
+        
+    def extract_image_features(self, image: np.ndarray) -> np.ndarray:
+        """Extrae un vector de características de una imagen."""
+        try:
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = image
+            
+            h, w = gray.shape
+            if h == 0 or w == 0:
+                return np.zeros(20)
+            
+            # Redimensionar para consistencia
+            gray = cv2.resize(gray, (64, 64))
+            
+            features = []
+            
+            # 1. Estadísticas básicas
+            features.extend([
+                np.mean(gray),
+                np.std(gray),
+                np.min(gray),
+                np.max(gray),
+                np.median(gray)
+            ])
+            
+            # 2. Análisis de bordes
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = np.sum(edges > 0) / (64 * 64)
+            features.append(edge_density)
+            
+            # 3. Análisis de textura (LBP simplificado)
+            lbp_hist = self.compute_lbp_histogram(gray)
+            features.extend(lbp_hist[:5])  # Solo primeros 5 bins
+            
+            # 4. Análisis de gradientes
+            grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+            grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+            features.extend([
+                np.mean(grad_mag),
+                np.std(grad_mag)
+            ])
+            
+            # 5. Análisis de simetría
+            symmetry_h = self.compute_symmetry(gray, axis=1)
+            symmetry_v = self.compute_symmetry(gray, axis=0)
+            features.extend([symmetry_h, symmetry_v])
+            
+            # 6. Análisis de densidad de píxeles
+            non_white = np.sum(gray < 240) / (64 * 64)
+            very_dark = np.sum(gray < 50) / (64 * 64)
+            features.extend([non_white, very_dark])
+            
+            # 7. Ratio de aspecto normalizado
+            aspect_ratio = min(h, w) / max(h, w) if max(h, w) > 0 else 0
+            features.append(aspect_ratio)
+            
+            return np.array(features[:20])  # Limitamos a 20 características
+            
+        except Exception as e:
+            logger.error(f"Error extrayendo características: {e}")
+            return np.zeros(20)
+    
+    def compute_lbp_histogram(self, image: np.ndarray, num_points: int = 8, radius: int = 1) -> np.ndarray:
+        """Computa un histograma LBP simplificado."""
+        h, w = image.shape
+        lbp = np.zeros_like(image)
+        
+        for i in range(radius, h - radius):
+            for j in range(radius, w - radius):
+                center = image[i, j]
+                code = 0
+                for k in range(num_points):
+                    angle = 2 * np.pi * k / num_points
+                    x = int(round(i + radius * np.cos(angle)))
+                    y = int(round(j + radius * np.sin(angle)))
+                    if 0 <= x < h and 0 <= y < w:
+                        if image[x, y] >= center:
+                            code |= (1 << k)
+                lbp[i, j] = code
+        
+        hist, _ = np.histogram(lbp.ravel(), bins=16, range=(0, 256))
+        hist = hist.astype(float)
+        hist /= (hist.sum() + 1e-7)
+        return hist
+    
+    def compute_symmetry(self, image: np.ndarray, axis: int) -> float:
+        """Computa la simetría de una imagen."""
+        try:
+            if axis == 0:  # Simetría vertical
+                h = image.shape[0]
+                top = image[:h//2, :]
+                bottom = np.flipud(image[h//2:, :])
+                min_h = min(top.shape[0], bottom.shape[0])
+                if min_h == 0:
+                    return 0.0
+                diff = np.mean(np.abs(top[:min_h, :].astype(float) - bottom[:min_h, :].astype(float)))
+            else:  # Simetría horizontal
+                w = image.shape[1]
+                left = image[:, :w//2]
+                right = np.fliplr(image[:, w//2:])
+                min_w = min(left.shape[1], right.shape[1])
+                if min_w == 0:
+                    return 0.0
+                diff = np.mean(np.abs(left[:, :min_w].astype(float) - right[:, :min_w].astype(float)))
+            
+            # Normalizar la diferencia
+            symmetry = max(0, 1 - diff / 255.0)
+            return symmetry
+        except:
+            return 0.0
+    
+    def compute_histogram_similarity(self, image: np.ndarray, reference_histograms: List[np.ndarray]) -> float:
+        """Computa similitud basada en histogramas."""
+        try:
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = image
+            
+            gray = cv2.resize(gray, (64, 64))
+            hist = cv2.calcHist([gray], [0], None, [32], [0, 256])
+            hist = hist.flatten()
+            hist = hist / (np.sum(hist) + 1e-7)
+            
+            max_similarity = 0.0
+            for ref_hist in reference_histograms:
+                # Usar correlación de histogramas
+                similarity = cv2.compareHist(hist.astype(np.float32), ref_hist.astype(np.float32), cv2.HISTCMP_CORREL)
+                max_similarity = max(max_similarity, similarity)
+            
+            return max(0.0, max_similarity)
+        except:
+            return 0.0
+    
+    def initialize_from_training_data(self) -> bool:
+        """Inicializa el analizador con los datos de entrenamiento."""
+        if not self.training_dir.exists():
+            logger.warning(f"Directorio de entrenamiento no encontrado: {self.training_dir}")
+            return False
+        
+        logger.info("Analizando datos de entrenamiento...")
+        
+        # Procesar logos
+        logo_dir = self.training_dir / "logos"
+        if logo_dir.exists():
+            for ext in ["*.png", "*.jpg", "*.jpeg"]:
+                for img_path in logo_dir.glob(ext):
+                    try:
+                        img = cv2.imread(str(img_path))
+                        if img is not None:
+                            features = self.extract_image_features(img)
+                            self.logo_features.append(features)
+                            
+                            # Guardar histograma
+                            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                            gray = cv2.resize(gray, (64, 64))
+                            hist = cv2.calcHist([gray], [0], None, [32], [0, 256])
+                            hist = hist.flatten()
+                            hist = hist / (np.sum(hist) + 1e-7)
+                            self.logo_histograms.append(hist)
+                            
+                            logger.debug(f"Logo procesado: {img_path.name}")
+                    except Exception as e:
+                        logger.warning(f"Error procesando logo {img_path}: {e}")
+        
+        # Procesar no-logos
+        no_logo_dir = self.training_dir / "no_logos"
+        if no_logo_dir.exists():
+            for ext in ["*.png", "*.jpg", "*.jpeg"]:
+                for img_path in no_logo_dir.glob(ext):
+                    try:
+                        img = cv2.imread(str(img_path))
+                        if img is not None:
+                            features = self.extract_image_features(img)
+                            self.no_logo_features.append(features)
+                            
+                            # Guardar histograma
+                            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                            gray = cv2.resize(gray, (64, 64))
+                            hist = cv2.calcHist([gray], [0], None, [32], [0, 256])
+                            hist = hist.flatten()
+                            hist = hist / (np.sum(hist) + 1e-7)
+                            self.no_logo_histograms.append(hist)
+                            
+                            logger.debug(f"No-logo procesado: {img_path.name}")
+                    except Exception as e:
+                        logger.warning(f"Error procesando no-logo {img_path}: {e}")
+        
+        if len(self.logo_features) == 0 or len(self.no_logo_features) == 0:
+            logger.error("No se encontraron suficientes ejemplos de entrenamiento")
+            return False
+        
+        # Normalizar características
+        all_features = np.vstack([self.logo_features, self.no_logo_features])
+        self.feature_scaler.fit(all_features)
+        
+        self.logo_features = [self.feature_scaler.transform(f.reshape(1, -1)).flatten() for f in self.logo_features]
+        self.no_logo_features = [self.feature_scaler.transform(f.reshape(1, -1)).flatten() for f in self.no_logo_features]
+        
+        self.is_initialized = True
+        logger.info(f"Analizador inicializado: {len(self.logo_features)} logos, {len(self.no_logo_features)} no-logos")
+        return True
+    
+    def classify_image(self, image: np.ndarray) -> Tuple[bool, float]:
+        """Clasifica una imagen basándose en similitud con los datos de entrenamiento."""
+        if not self.is_initialized:
+            return False, 0.0
+        
+        try:
+            # Extraer características
+            features = self.extract_image_features(image)
+            features = self.feature_scaler.transform(features.reshape(1, -1)).flatten()
+            
+            # Calcular similitud con logos
+            logo_similarities = []
+            for logo_feat in self.logo_features:
+                similarity = 1 - cosine(features, logo_feat)
+                logo_similarities.append(max(0, similarity))
+            
+            # Calcular similitud con no-logos
+            no_logo_similarities = []
+            for no_logo_feat in self.no_logo_features:
+                similarity = 1 - cosine(features, no_logo_feat)
+                no_logo_similarities.append(max(0, similarity))
+            
+            # Similitud por histogramas
+            logo_hist_sim = self.compute_histogram_similarity(image, self.logo_histograms)
+            no_logo_hist_sim = self.compute_histogram_similarity(image, self.no_logo_histograms)
+            
+            # Combinar similitudes
+            max_logo_sim = max(logo_similarities) if logo_similarities else 0
+            max_no_logo_sim = max(no_logo_similarities) if no_logo_similarities else 0
+            
+            # Ponderación: 70% características, 30% histogramas
+            logo_score = 0.7 * max_logo_sim + 0.3 * logo_hist_sim
+            no_logo_score = 0.7 * max_no_logo_sim + 0.3 * no_logo_hist_sim
+            
+            # Decisión conservadora: debe ser significativamente más similar a logos
+            is_logo = logo_score > no_logo_score and logo_score > 0.6
+            confidence = logo_score - no_logo_score + 0.5  # Normalizar a [0,1]
+            confidence = max(0, min(1, confidence))
+            
+            logger.debug(f"Clasificación por similitud: logo={logo_score:.3f}, no_logo={no_logo_score:.3f}, "
+                        f"final={'LOGO' if is_logo else 'NO-LOGO'} ({confidence:.3f})")
+            
+            return is_logo, confidence
+            
+        except Exception as e:
+            logger.error(f"Error en clasificación por similitud: {e}")
+            return False, 0.0
+
 class InpaintingProcessor:
-    """Procesador para rellenar áreas de logos de manera natural."""
+    """Procesador mejorado para rellenar áreas de logos."""
     
-    def __init__(self):
-        pass
-    
-    def create_mask_from_logo(self, image: np.ndarray, logo_bbox: Tuple[int, int, int, int]) -> np.ndarray:
+    def inpaint_logo_area(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """
-        Crea una máscara para el área del logo.
-        
-        Args:
-            image: Imagen original
-            logo_bbox: Bounding box del logo (x, y, width, height)
-            
-        Returns:
-            Máscara binaria del logo
-        """
-        x, y, w, h = logo_bbox
-        mask = np.zeros(image.shape[:2], dtype=np.uint8)
-        mask[y:y+h, x:x+w] = 255
-        
-        # Suavizar los bordes de la máscara
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        mask = cv2.GaussianBlur(mask, (5, 5), 0)
-        
-        return mask
-    
-    def inpaint_logo_area(self, image: np.ndarray, mask: np.ndarray, method: str = 'telea') -> np.ndarray:
-        """
-        Rellena el área del logo usando técnicas de inpainting.
-        
-        Args:
-            image: Imagen original
-            mask: Máscara del área a rellenar
-            method: Método de inpainting ('telea' o 'ns')
-            
-        Returns:
-            Imagen con el área rellenada
+        Rellena el área del logo usando técnicas de inpainting mejoradas.
         """
         try:
-            if method == 'telea':
-                inpainted = cv2.inpaint(image, mask, 3, cv2.INPAINT_TELEA)
-            else:  # ns (Navier-Stokes)
-                inpainted = cv2.inpaint(image, mask, 3, cv2.INPAINT_NS)
+            # Convertir imagen a uint8 si es necesario
+            if image.dtype != np.uint8:
+                image = (image * 255).astype(np.uint8) if image.max() <= 1.0 else image.astype(np.uint8)
+            
+            # Asegurar que la máscara sea binaria
+            if mask.dtype != np.uint8:
+                mask = (mask * 255).astype(np.uint8) if mask.max() <= 1.0 else mask.astype(np.uint8)
+            
+            # Método Telea (más rápido y efectivo para logos)
+            inpainted = cv2.inpaint(image, mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+            
+            # Si falla, usar método alternativo
+            if inpainted is None or np.array_equal(inpainted, image):
+                inpainted = self.simple_inpaint(image, mask)
             
             return inpainted
             
         except Exception as e:
             logger.error(f"Error en inpainting: {e}")
-            # Fallback: rellenar con el color promedio del entorno
-            return self.fallback_inpaint(image, mask)
+            return self.simple_inpaint(image, mask)
     
-    def fallback_inpaint(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """
-        Método alternativo de relleno usando interpolación de colores del entorno.
-        
-        Args:
-            image: Imagen original
-            mask: Máscara del área a rellenar
-            
-        Returns:
-            Imagen con el área rellenada
-        """
+    def simple_inpaint(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Método simple de inpainting usando interpolación."""
         result = image.copy()
         
-        # Expandir la máscara para obtener píxeles del entorno
-        kernel = np.ones((10, 10), np.uint8)
+        # Expandir máscara para obtener contexto
+        kernel = np.ones((7, 7), np.uint8)
         expanded_mask = cv2.dilate(mask, kernel, iterations=1)
         border_mask = expanded_mask - mask
         
-        # Calcular color promedio del borde
+        # Rellenar con color promedio del borde
         if len(image.shape) == 3:
             for channel in range(image.shape[2]):
                 border_pixels = image[:, :, channel][border_mask > 0]
@@ -316,273 +467,530 @@ class InpaintingProcessor:
         return result
 
 class AdvancedPDFLogoRemover:
+    """Sistema mejorado de detección y eliminación de logos."""
+    
+    def __init__(self, model_path: str = "logo_classifier.pth", training_data_dir: str = "training_data"):
+        self.model_path = model_path
+        self.model = None
+        
+        # Inicializar componentes
+        self.ocr_detector = OCRDetector()
+        self.inpainter = InpaintingProcessor()
+        self.training_analyzer = TrainingDataAnalyzer(training_data_dir)
+        
+        # Inicializar analizador de datos de entrenamiento
+        logger.info("Inicializando analizador de datos de entrenamiento...")
+        self.training_analyzer.initialize_from_training_data()
+        
+        # Transformaciones para el modelo
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        # Cargar modelo si existe
+        self.load_model()
+    
+    def heuristic_logo_detection(self, image: np.ndarray) -> Tuple[bool, float]:
+        """
+        Detección mejorada y más conservadora de logos usando características heurísticas.
+        """
+        try:
+            height, width = image.shape[:2]
+            
+            # Filtro de tamaño más estricto para logos típicos
+            min_size = min(height, width)
+            max_size = max(height, width)
+            
+            # Los logos suelen ser medianos/pequeños, no muy grandes ni muy pequeños
+            if min_size < 30 or max_size > 400 or min_size > 200:
+                return False, 0.0
+            
+            # Convertir a escala de grises
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = image
+            
+            # 1. Análisis de contornos estructurados (logos tienen formas definidas)
+            edges = cv2.Canny(gray, 50, 150)
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Evaluar calidad de contornos
+            significant_contours = [c for c in contours if cv2.contourArea(c) > (height * width * 0.05)]
+            contour_score = min(len(significant_contours) / 3.0, 1.0) if len(significant_contours) > 0 else 0.0
+            
+            # 2. Análisis de texto/símbolos (logos suelen tener texto o formas geométricas)
+            # Detectar líneas horizontales y verticales (características de logos)
+            kernel_h = np.ones((1, max(width//10, 3)), np.uint8)
+            kernel_v = np.ones((max(height//10, 3), 1), np.uint8)
+            
+            lines_h = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel_h)
+            lines_v = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel_v)
+            
+            line_ratio = (np.sum(lines_h > 0) + np.sum(lines_v > 0)) / (height * width)
+            line_score = min(line_ratio * 5, 1.0)
+            
+            # 3. Análisis de densidad y distribución
+            # Los logos tienen distribución no uniforme de píxeles
+            non_white_pixels = np.sum(gray < 240) / (height * width)
+            density_score = min(non_white_pixels * 2, 1.0) if non_white_pixels > 0.1 else 0.0
+            
+            # 4. Análisis de aspectos geométricos
+            aspect_ratio = max_size / min_size
+            # Los logos suelen ser más cuadrados o rectangulares moderados
+            aspect_score = max(0, 1 - abs(aspect_ratio - 1.5) / 3) if aspect_ratio <= 4 else 0.0
+            
+            # 5. Análisis de varianza local (logos tienen regiones con diferentes intensidades)
+            # Dividir imagen en bloques y analizar varianza
+            block_size = min(height//3, width//3, 20)
+            if block_size > 5:
+                variances = []
+                for i in range(0, height-block_size, block_size):
+                    for j in range(0, width-block_size, block_size):
+                        block = gray[i:i+block_size, j:j+block_size]
+                        variances.append(np.var(block))
+                
+                if variances:
+                    avg_var = np.mean(variances)
+                    var_score = min(avg_var / 1000, 1.0) if avg_var > 50 else 0.0
+                else:
+                    var_score = 0.0
+            else:
+                var_score = 0.0
+            
+            # Combinación más conservadora con pesos ajustados
+            confidence = (
+                contour_score * 0.25 +    # Contornos definidos
+                line_score * 0.20 +       # Líneas/estructura
+                density_score * 0.20 +    # Densidad apropiada
+                aspect_score * 0.15 +     # Aspecto adecuado
+                var_score * 0.20          # Varianza local
+            )
+            
+            # Umbral más alto para ser más conservador
+            is_logo = confidence > 0.5
+            
+            logger.debug(f"Análisis heurístico mejorado: contornos={contour_score:.3f}, "
+                        f"líneas={line_score:.3f}, densidad={density_score:.3f}, "
+                        f"aspecto={aspect_score:.3f}, varianza={var_score:.3f}, final={confidence:.3f}")
+            
+            return is_logo, confidence
+            
+        except Exception as e:
+            logger.error(f"Error en detección heurística: {e}")
+            return False, 0.0
+    
     def extract_and_analyze_images(self, page) -> List[Dict]:
         """
-        Extrae y analiza imágenes de una página usando ML y OCR.
-
-        Args:
-            page: Página de PyMuPDF
-
-        Returns:
-            Lista de diccionarios con análisis completo de imágenes
+        Extrae y analiza imágenes de una página de forma más robusta.
         """
         images = []
-        image_list = page.get_images(full=True)  # full=True para obtener info completa
-
-        for img_index, img in enumerate(image_list):
-            try:
-                # Extraer imagen
-                xref = img[0]
-                base_image = page.parent.extract_image(xref)
-                image_bytes = base_image.get("image")
-
-                if image_bytes is None:
-                    logger.warning(f"Imagen con xref {xref} no contiene datos de imagen.")
-                    continue
-
-                pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-                # Aplicar eliminación de texto sensible (si está definida)
-                if hasattr(self, "remove_sensitive_text_regions"):
-                    pil_image = self.remove_sensitive_text_regions(pil_image)
-
-                image_array = np.array(pil_image)
-
-                # Obtener rectángulo de la imagen en la página
-                image_rects = page.get_image_rects(xref)
-                if not image_rects:
-                    logger.warning(f"No se encontró rectángulo para la imagen xref {xref}.")
-                    continue
-
-                rect = image_rects[0]
-
-                # Análisis con ML
-                is_logo_ml, confidence_ml = self.predict_logo(image_array)
-
-                # Análisis con OCR
-                ocr_result = self.ocr_detector.detect_text_in_logo(image_array)
-
-                # Puntuación combinada
-                combined_score = (
-                    confidence_ml * 0.7 +
-                    (0.8 if ocr_result.get('is_logo_text', False) else 0.2) * 0.3
-                )
-
-                is_logo_final = combined_score > 0.5
-
-                analysis = {
-                    'xref': xref,
-                    'index': img_index,
-                    'image': image_array,
-                    'rect': rect,
-                    'size': (image_array.shape[1], image_array.shape[0]),
-                    'ml_prediction': {
-                        'is_logo': is_logo_ml,
-                        'confidence': confidence_ml
-                    },
-                    'ocr_analysis': ocr_result,
-                    'final_prediction': {
-                        'is_logo': is_logo_final,
-                        'combined_score': combined_score
+        
+        try:
+            image_list = page.get_images(full=True)
+            logger.debug(f"Encontradas {len(image_list)} imágenes en la página")
+            
+            for img_index, img in enumerate(image_list):
+                try:
+                    xref = img[0]
+                    
+                    # Extraer imagen usando método más robusto
+                    try:
+                        base_image = page.parent.extract_image(xref)
+                        image_bytes = base_image["image"]
+                        image_ext = base_image["ext"]
+                        
+                        if not image_bytes:
+                            logger.warning(f"Imagen {img_index} sin datos")
+                            continue
+                            
+                    except Exception as e:
+                        logger.warning(f"No se pudo extraer imagen {img_index}: {e}")
+                        continue
+                    
+                    # Convertir a array numpy
+                    try:
+                        pil_image = Image.open(io.BytesIO(image_bytes))
+                        if pil_image.mode not in ['RGB', 'RGBA']:
+                            pil_image = pil_image.convert('RGB')
+                        image_array = np.array(pil_image)
+                        
+                        if image_array.size == 0:
+                            continue
+                            
+                    except Exception as e:
+                        logger.warning(f"Error convirtiendo imagen {img_index}: {e}")
+                        continue
+                    
+                    # Obtener rectángulo de la imagen
+                    try:
+                        image_rects = page.get_image_rects(xref)
+                        if not image_rects:
+                            logger.warning(f"No se encontró rectángulo para imagen {img_index}")
+                            continue
+                        rect = image_rects[0]
+                    except Exception as e:
+                        logger.warning(f"Error obteniendo rectángulo de imagen {img_index}: {e}")
+                        continue
+                    
+                    # Análisis ML si disponible
+                    if self.model is not None:
+                        try:
+                            is_logo_ml, confidence_ml = self.predict_logo(image_array)
+                        except Exception as e:
+                            logger.warning(f"Error en predicción ML para imagen {img_index}: {e}")
+                            is_logo_ml, confidence_ml = False, 0.0
+                    else:
+                        is_logo_ml, confidence_ml = False, 0.0
+                    
+                    # Análisis heurístico
+                    try:
+                        is_logo_heur, confidence_heur = self.heuristic_logo_detection(image_array)
+                    except Exception as e:
+                        logger.warning(f"Error en análisis heurístico para imagen {img_index}: {e}")
+                        is_logo_heur, confidence_heur = False, 0.0
+                    
+                    # Análisis por similitud con datos de entrenamiento
+                    try:
+                        is_logo_similarity, confidence_similarity = self.training_analyzer.classify_image(image_array)
+                    except Exception as e:
+                        logger.warning(f"Error en análisis por similitud para imagen {img_index}: {e}")
+                        is_logo_similarity, confidence_similarity = False, 0.0
+                    
+                    # Análisis OCR
+                    try:
+                        ocr_result = self.ocr_detector.detect_text_in_logo(image_array)
+                    except Exception as e:
+                        logger.warning(f"Error en OCR para imagen {img_index}: {e}")
+                        ocr_result = {'has_text': False, 'is_logo_text': False, 'text_content': '', 'confidence': 0.0}
+                    
+                    # Combinación de resultados con prioridad en datos de entrenamiento
+                    if self.training_analyzer.is_initialized:
+                        if self.model is not None:
+                            # Con modelo ML y datos de entrenamiento
+                            ml_weight = 0.3
+                            heur_weight = 0.15
+                            similarity_weight = 0.45  # Mayor peso a similitud
+                            ocr_weight = 0.1
+                        else:
+                            # Solo con datos de entrenamiento (sin modelo ML)
+                            ml_weight = 0.0
+                            heur_weight = 0.25
+                            similarity_weight = 0.65  # Máximo peso a similitud
+                            ocr_weight = 0.1
+                    else:
+                        # Sin datos de entrenamiento (modo legacy)
+                        if self.model is not None:
+                            ml_weight = 0.6
+                            heur_weight = 0.25
+                            similarity_weight = 0.0
+                            ocr_weight = 0.15
+                        else:
+                            ml_weight = 0.0
+                            heur_weight = 0.7
+                            similarity_weight = 0.0
+                            ocr_weight = 0.3
+                    
+                    # OCR: solo considerar como logo si realmente tiene texto típico de logos
+                    text_content = ocr_result.get('text_content', '').lower().strip()
+                    logo_indicators = ['logo', 'brand', 'company', 'corp', 'inc', 'ltd', 'copyright', '©', '®', '™']
+                    has_logo_text = any(indicator in text_content for indicator in logo_indicators)
+                    
+                    # Ajustar score OCR basado en contenido real
+                    if has_logo_text:
+                        ocr_score = 0.9
+                    elif ocr_result.get('has_text', False) and len(text_content) > 3:
+                        # Texto genérico podría ser logo, pero menos probable
+                        ocr_score = 0.3
+                    else:
+                        ocr_score = 0.1
+                    
+                    combined_score = (confidence_ml * ml_weight + 
+                                    confidence_heur * heur_weight + 
+                                    confidence_similarity * similarity_weight +
+                                    ocr_score * ocr_weight)
+                    
+                    # Decisión final más rigurosa basada en datos de entrenamiento
+                    if self.training_analyzer.is_initialized:
+                        # Si el analizador de similitud dice que NO es logo, respetarlo
+                        if confidence_similarity < 0.3:
+                            is_logo_final = False
+                        # Si dice que SÍ es logo con alta confianza, también respetarlo
+                        elif is_logo_similarity and confidence_similarity > 0.7:
+                            is_logo_final = True
+                        # En casos intermedios, usar score combinado con umbral alto
+                        else:
+                            is_logo_final = combined_score > 0.75
+                    else:
+                        # Sin datos de entrenamiento, usar umbral conservador
+                        is_logo_final = combined_score > 0.6
+                    
+                    analysis = {
+                        'xref': xref,
+                        'index': img_index,
+                        'image': image_array,
+                        'rect': rect,
+                        'size': (image_array.shape[1], image_array.shape[0]),
+                        'ml_prediction': {
+                            'is_logo': is_logo_ml,
+                            'confidence': confidence_ml
+                        },
+                        'heuristic_prediction': {
+                            'is_logo': is_logo_heur,
+                            'confidence': confidence_heur
+                        },
+                        'similarity_prediction': {
+                            'is_logo': is_logo_similarity,
+                            'confidence': confidence_similarity
+                        },
+                        'ocr_analysis': ocr_result,
+                        'final_prediction': {
+                            'is_logo': is_logo_final,
+                            'combined_score': combined_score
+                        }
                     }
-                }
-
-                images.append(analysis)
-
-                logger.info(
-                    f"Imagen {img_index}: ML={confidence_ml:.3f}, "
-                    f"OCR={'Sí' if ocr_result.get('is_logo_text', False) else 'No'}, "
-                    f"Final={combined_score:.3f}"
-                )
-
-            except Exception as e:
-                logger.error(f"Error analizando imagen {img_index}: {e}", exc_info=True)
-                continue
-
+                    
+                    images.append(analysis)
+                    
+                    logger.info(f"IMAGE Imagen {img_index} ({image_array.shape[1]}x{image_array.shape[0]}): "
+                              f"ML={confidence_ml:.3f}, Heur={confidence_heur:.3f}, "
+                              f"Simil={confidence_similarity:.3f}, "
+                              f"OCR={'Sí' if has_logo_text else 'Parcial' if ocr_result.get('has_text', False) else 'No'}, "
+                              f"Final={combined_score:.3f} {'OK LOGO' if is_logo_final else 'X NO-LOGO'}")
+                    
+                except Exception as e:
+                    logger.error(f"Error procesando imagen {img_index}: {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Error extrayendo imágenes de la página: {e}")
+            
         return images
-
+    
+    def remove_logo_advanced(self, page, logo_data: Dict) -> bool:
+        """
+        Elimina un logo usando el método más efectivo disponible.
+        """
+        try:
+            rect = logo_data['rect']
+            
+            # Método 1: Rectángulo blanco simple (más confiable)
+            page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), width=0)
+            
+            # Método 2: Intentar inpainting si la imagen es suficientemente grande
+            image = logo_data.get('image')
+            if image is not None and image.size > 1000:  # Solo para imágenes grandes
+                try:
+                    height, width = image.shape[:2]
+                    mask = np.zeros((height, width), dtype=np.uint8)
+                    mask.fill(255)  # Máscara completa
+                    
+                    inpainted = self.inpainter.inpaint_logo_area(image, mask)
+                    # Nota: PyMuPDF no permite reemplazar imágenes fácilmente,
+                    # por lo que mantenemos el método del rectángulo
+                except Exception as e:
+                    logger.debug(f"Inpainting falló, usando rectángulo: {e}")
+            
+            logger.info(f"OK Logo eliminado en rectángulo: {rect}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"ERROR Error eliminando logo: {e}")
+            return False
     
     def prepare_training_data(self, data_dir: str) -> Tuple[List[str], List[int]]:
-        """
-        Prepara los datos de entrenamiento desde un directorio organizado.
-        
-        Estructura esperada:
-        data_dir/
-        ├── logos/          # Imágenes que SÍ son logos
-        └── no_logos/       # Imágenes que NO son logos
-        
-        Args:
-            data_dir: Directorio con los datos de entrenamiento
-            
-        Returns:
-            Tupla con listas de rutas de imágenes y etiquetas
-        """
+        """Prepara datos de entrenamiento con validación de calidad."""
         data_path = Path(data_dir)
         
         if not data_path.exists():
             raise FileNotFoundError(f"El directorio {data_dir} no existe")
         
-        # Recopilar imágenes y etiquetas
         image_paths = []
         labels = []
+        invalid_images = []
         
         # Logos (etiqueta 1)
         logo_dir = data_path / "logos"
         if logo_dir.exists():
-            for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp']:
+            logger.info(f"Procesando imágenes de logos desde {logo_dir}")
+            for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.gif', '*.svg']:
                 for img_path in logo_dir.glob(ext):
-                    image_paths.append(str(img_path))
-                    labels.append(1)
+                    try:
+                        # Validar que la imagen se puede cargar
+                        test_img = Image.open(img_path)
+                        if test_img.size[0] > 10 and test_img.size[1] > 10:  # Mínimo 10x10
+                            image_paths.append(str(img_path))
+                            labels.append(1)
+                            logger.debug(f"Logo añadido: {img_path.name} ({test_img.size})")
+                        else:
+                            invalid_images.append(str(img_path))
+                        test_img.close()
+                    except Exception as e:
+                        logger.warning(f"Error cargando {img_path}: {e}")
+                        invalid_images.append(str(img_path))
         
         # No logos (etiqueta 0)
         no_logo_dir = data_path / "no_logos"
         if no_logo_dir.exists():
-            for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp']:
+            logger.info(f"Procesando imágenes sin logos desde {no_logo_dir}")
+            for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.gif']:
                 for img_path in no_logo_dir.glob(ext):
-                    image_paths.append(str(img_path))
-                    labels.append(0)
+                    try:
+                        # Validar que la imagen se puede cargar
+                        test_img = Image.open(img_path)
+                        if test_img.size[0] > 10 and test_img.size[1] > 10:  # Mínimo 10x10
+                            image_paths.append(str(img_path))
+                            labels.append(0)
+                            logger.debug(f"No-logo añadido: {img_path.name} ({test_img.size})")
+                        else:
+                            invalid_images.append(str(img_path))
+                        test_img.close()
+                    except Exception as e:
+                        logger.warning(f"Error cargando {img_path}: {e}")
+                        invalid_images.append(str(img_path))
         
-        logger.info(f"Datos preparados: {len(image_paths)} imágenes "
-                   f"({labels.count(1)} logos, {labels.count(0)} no logos)")
+        if invalid_images:
+            logger.warning(f"Se encontraron {len(invalid_images)} imágenes inválidas que serán ignoradas")
+        
+        # Verificar balance de datos
+        logo_count = labels.count(1)
+        no_logo_count = labels.count(0)
+        
+        if logo_count == 0 or no_logo_count == 0:
+            raise ValueError("Se necesitan imágenes tanto de logos como de no-logos para entrenar")
+        
+        logger.info(f"Datos preparados: {len(image_paths)} imágenes válidas "
+                   f"({logo_count} logos, {no_logo_count} no logos)")
+        
+        # Reportar balance
+        if abs(logo_count - no_logo_count) > max(logo_count, no_logo_count) * 0.5:
+            logger.warning(f"Datos desbalanceados: {logo_count} logos vs {no_logo_count} no-logos. "
+                         f"Considera agregar más imágenes a la categoría menor.")
         
         return image_paths, labels
     
-    def train_model(self, data_dir: str, epochs: int = 10, batch_size: int = 32) -> None:
-        """
-        Entrena el modelo de detección de logos.
+    def train_model(self, data_dir: str, epochs: int = 10, batch_size: int = 16) -> None:
+        """Entrena el modelo de detección."""
+        logger.info("INFO Iniciando entrenamiento del modelo...")
         
-        Args:
-            data_dir: Directorio con datos de entrenamiento
-            epochs: Número de épocas de entrenamiento
-            batch_size: Tamaño del batch
-        """
-        logger.info("Iniciando entrenamiento del modelo...")
-        
-        # Preparar datos
-        image_paths, labels = self.prepare_training_data(data_dir)
-        
-        if len(image_paths) == 0:
-            raise ValueError("No se encontraron imágenes de entrenamiento")
-        
-        # Dividir en entrenamiento y validación
-        train_paths, val_paths, train_labels, val_labels = train_test_split(
-            image_paths, labels, test_size=0.2, random_state=42, stratify=labels
-        )
-        
-        # Crear datasets
-        train_dataset = LogoDataset(train_paths, train_labels, self.transform)
-        val_dataset = LogoDataset(val_paths, val_labels, self.transform)
-        
-        # Crear data loaders
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-        
-        # Inicializar modelo
-        self.model = LogoDetectorCNN(num_classes=2)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(device)
-        
-        # Configurar optimizador y función de pérdida
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-        
-        # Entrenar
-        best_val_acc = 0.0
-        
-        for epoch in range(epochs):
-            # Entrenamiento
-            self.model.train()
-            train_loss = 0.0
-            train_correct = 0
-            train_total = 0
+        try:
+            image_paths, labels = self.prepare_training_data(data_dir)
             
-            for images, labels in train_loader:
-                images, labels = images.to(device), labels.to(device)
+            if len(image_paths) < 10:
+                raise ValueError("Se necesitan al menos 10 imágenes para entrenar")
+            
+            # Dividir datos
+            train_paths, val_paths, train_labels, val_labels = train_test_split(
+                image_paths, labels, test_size=0.2, random_state=42, stratify=labels
+            )
+            
+            # Crear datasets
+            train_dataset = LogoDataset(train_paths, train_labels, self.transform)
+            val_dataset = LogoDataset(val_paths, val_labels, self.transform)
+            
+            # Data loaders
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+            
+            # Modelo
+            self.model = LogoDetectorCNN(num_classes=2)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.model.to(device)
+            logger.info(f"Usando dispositivo: {device}")
+            
+            # Optimizador y loss
+            criterion = nn.CrossEntropyLoss()
+            optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=1e-4)
+            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+            
+            best_val_acc = 0.0
+            
+            for epoch in range(epochs):
+                # Entrenamiento
+                self.model.train()
+                train_loss = 0.0
+                train_correct = 0
+                train_total = 0
                 
-                optimizer.zero_grad()
-                outputs = self.model(images)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
-                
-                train_loss += loss.item()
-                _, predicted = torch.max(outputs.data, 1)
-                train_total += labels.size(0)
-                train_correct += (predicted == labels).sum().item()
-            
-            # Validación
-            self.model.eval()
-            val_correct = 0
-            val_total = 0
-            
-            with torch.no_grad():
-                for images, labels in val_loader:
+                for batch_idx, (images, labels) in enumerate(train_loader):
                     images, labels = images.to(device), labels.to(device)
+                    
+                    optimizer.zero_grad()
                     outputs = self.model(images)
+                    loss = criterion(outputs, labels)
+                    loss.backward()
+                    optimizer.step()
+                    
+                    train_loss += loss.item()
                     _, predicted = torch.max(outputs.data, 1)
-                    val_total += labels.size(0)
-                    val_correct += (predicted == labels).sum().item()
+                    train_total += labels.size(0)
+                    train_correct += (predicted == labels).sum().item()
+                
+                # Validación
+                self.model.eval()
+                val_correct = 0
+                val_total = 0
+                
+                with torch.no_grad():
+                    for images, labels in val_loader:
+                        images, labels = images.to(device), labels.to(device)
+                        outputs = self.model(images)
+                        _, predicted = torch.max(outputs.data, 1)
+                        val_total += labels.size(0)
+                        val_correct += (predicted == labels).sum().item()
+                
+                train_acc = 100 * train_correct / train_total
+                val_acc = 100 * val_correct / val_total
+                
+                logger.info(f'Época {epoch+1}/{epochs}: Train Acc: {train_acc:.2f}%, Val Acc: {val_acc:.2f}%')
+                
+                # Guardar mejor modelo
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    self.save_model()
+                
+                scheduler.step()
             
-            train_acc = 100 * train_correct / train_total
-            val_acc = 100 * val_correct / val_total
+            logger.info(f"OK Entrenamiento completado. Mejor precisión: {best_val_acc:.2f}%")
             
-            logger.info(f'Época {epoch+1}/{epochs}: '
-                       f'Train Acc: {train_acc:.2f}%, Val Acc: {val_acc:.2f}%')
-            
-            # Guardar mejor modelo
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                self.save_model()
-        
-        logger.info(f"Entrenamiento completado. Mejor precisión: {best_val_acc:.2f}%")
+        except Exception as e:
+            logger.error(f"ERROR Error en entrenamiento: {e}")
+            raise
     
     def save_model(self) -> None:
-        """Guarda el modelo entrenado."""
+        """Guarda el modelo."""
         if self.model is not None:
             torch.save(self.model.state_dict(), self.model_path)
-            logger.info(f"Modelo guardado en {self.model_path}")
+            logger.info(f"SAVE Modelo guardado en {self.model_path}")
     
     def load_model(self) -> bool:
-        """
-        Carga un modelo preentrenado.
-        
-        Returns:
-            True si el modelo se cargó exitosamente
-        """
+        """Carga el modelo."""
         if os.path.exists(self.model_path):
             try:
                 self.model = LogoDetectorCNN(num_classes=2)
                 self.model.load_state_dict(torch.load(self.model_path, map_location='cpu'))
                 self.model.eval()
-                logger.info(f"Modelo cargado desde {self.model_path}")
+                logger.info(f"OK Modelo cargado desde {self.model_path}")
                 return True
             except Exception as e:
-                logger.error(f"Error cargando modelo: {e}")
+                logger.error(f"ERROR Error cargando modelo: {e}")
                 return False
         return False
     
     def predict_logo(self, image: np.ndarray) -> Tuple[bool, float]:
-        """
-        Predice si una imagen contiene un logo usando el modelo entrenado.
-        
-        Args:
-            image: Imagen en formato numpy array
-            
-        Returns:
-            Tupla (es_logo, confianza)
-        """
+        """Predice si una imagen es un logo."""
         if self.model is None:
-            logger.warning("Modelo no disponible, usando detección heurística")
-            return self.fallback_logo_detection(image)
+            return False, 0.0
         
         try:
-            # Convertir a PIL Image
+            # Preparar imagen
             if len(image.shape) == 3:
                 pil_image = Image.fromarray(image)
             else:
                 pil_image = Image.fromarray(image).convert('RGB')
             
-            # Aplicar transformaciones
             input_tensor = self.transform(pil_image).unsqueeze(0)
             
             # Predicción
@@ -601,166 +1009,59 @@ class AdvancedPDFLogoRemover:
                 return is_logo, conf_score
                 
         except Exception as e:
-            logger.error(f"Error en predicción: {e}")
-            return self.fallback_logo_detection(image)
-    
-    def fallback_logo_detection(self, image: np.ndarray) -> Tuple[bool, float]:
-        """Detección de logos por métodos heurísticos como fallback."""
-        height, width = image.shape[:2]
-        
-        # Criterios básicos
-        if not (50 <= max(height, width) <= 300):
+            logger.error(f"Error en predicción ML: {e}")
             return False, 0.0
-        
-        # Análisis de bordes
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = image
-            
-        edges = cv2.Canny(gray, 50, 150)
-        edge_ratio = np.sum(edges > 0) / (height * width)
-        
-        is_logo = edge_ratio > 0.1
-        confidence = min(edge_ratio * 2, 1.0)  # Normalizar a [0,1]
-        
-        return is_logo, confidence
     
-    def extract_and_analyze_images(self, page) -> List[Dict]:
+    def remove_text_blocks(self, doc, keywords: List[str] = None) -> int:
         """
-        Extrae imágenes de una página y las analiza para detectar logos.
+        Elimina bloques de texto específicos del documento.
+        """
+        if keywords is None:
+            keywords = TEXT_BLOCKS_TO_REMOVE
         
-        Args:
-            page: Página de PyMuPDF
+        removed_count = 0
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
             
-        Returns:
-            Lista de diccionarios con información de las imágenes analizadas
-        """
-        logger.info(f"Extrayendo imágenes de la página {page.number + 1}")  
-        images = []
-        image_list = page.get_images(full=True)  # full=True para obtener info completa
-
-        for img_index, img in enumerate(image_list):
             try:
-                # Extraer imagen
-                xref = img[0]
-                base_image = page.parent.extract_image(xref)
-                image_bytes = base_image.get("image")
-
-                if image_bytes is None:
-                    logger.warning(f"Imagen con xref {xref} no contiene datos de imagen.")
-                    continue
-
-                pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-                # Aplicar eliminación de texto sensible (si está definida)
-                if hasattr(self, "remove_sensitive_text_regions"):
-                    pil_image = self.remove_sensitive_text_regions(pil_image)
-
-                image_array = np.array(pil_image)
-
-                # Obtener rectángulo de la imagen en la página
-                image_rects = page.get_image_rects(xref)
-                if not image_rects:
-                    logger.warning(f"No se encontró rectángulo para la imagen xref {xref}.")
-                    continue
-
-                rect = image_rects[0]
-
-                # Análisis con ML
-                is_logo_ml, confidence_ml = self.predict_logo(image_array)
-
-                # Análisis con OCR
-                ocr_result = self.ocr_detector.detect_text_in_logo(image_array)
-
-                # Puntuación combinada (ajustar pesos según necesidad)
-                combined_score = (
-                    confidence_ml * 0.7 +
-                    (0.8 if ocr_result.get('is_logo_text', False) else 0.2) * 0.3
-                )
-
-                is_logo_final = combined_score > 0.5
-
-                analysis = {
-                    'xref': xref,
-                    'index': img_index,
-                    'image': image_array,
-                    'rect': rect,
-                    'size': (image_array.shape[1], image_array.shape[0]),
-                    'ml_prediction': {
-                        'is_logo': is_logo_ml,
-                        'confidence': confidence_ml
-                    },
-                    'ocr_analysis': ocr_result,
-                    'final_prediction': {
-                        'is_logo': is_logo_final,
-                        'combined_score': combined_score
-                    }
-                }
-
-                images.append(analysis)
-
-                logger.info(
-                    f"Imagen {img_index}: ML={confidence_ml:.3f}, "
-                    f"OCR={'Sí' if ocr_result.get('is_logo_text', False) else 'No'}, "
-                    f"Final={combined_score:.3f}"
-                )
-
+                # Método 1: Buscar por bloques de texto
+                blocks = page.get_text("blocks")
+                for block in blocks:
+                    if len(block) >= 5:
+                        x0, y0, x1, y1, text = block[:5]
+                        text_lower = text.lower()
+                        
+                        if any(keyword.lower() in text_lower for keyword in keywords):
+                            rect = fitz.Rect(x0, y0, x1, y1)
+                            page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), width=0)
+                            removed_count += 1
+                            logger.info(f"CLEAN Eliminado bloque en página {page_num + 1}: '{text[:30]}...'")
+                
+                # Método 2: Buscar por palabras específicas
+                for keyword in keywords:
+                    text_instances = page.search_for(keyword)
+                    for inst in text_instances:
+                        # Expandir el rectángulo un poco
+                        expanded_rect = fitz.Rect(
+                            inst.x0 - 5, inst.y0 - 2, 
+                            inst.x1 + 5, inst.y1 + 2
+                        )
+                        page.draw_rect(expanded_rect, color=(1, 1, 1), fill=(1, 1, 1), width=0)
+                        removed_count += 1
+                        logger.info(f"CLEAN Eliminada palabra '{keyword}' en página {page_num + 1}")
+                        
             except Exception as e:
-                logger.error(f"Error analizando imagen {img_index}: {e}", exc_info=True)
-                continue
-
-        return images
-
-    
-    def remove_logo_with_inpainting(self, page, logo_data: Dict) -> None:
-        """
-        Elimina un logo usando técnicas de inpainting.
+                logger.error(f"Error eliminando texto en página {page_num + 1}: {e}")
         
-        Args:
-            page: Página de PyMuPDF
-            logo_data: Datos del logo a eliminar
-        """
-        try:
-            rect = logo_data['rect']
-            image = logo_data['image']
-            
-            # Convertir coordenadas del rectángulo
-            x0, y0, x1, y1 = rect
-            bbox = (int(x0), int(y0), int(x1-x0), int(y1-y0))
-            
-            # Crear máscara
-            mask = self.inpainter.create_mask_from_logo(image, bbox)
-            
-            # Aplicar inpainting
-            inpainted = self.inpainter.inpaint_logo_area(image, mask)
-            
-            # Por limitaciones de PyMuPDF, usamos el método de rectángulo
-            page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1))
-            
-            logger.info(f"Logo eliminado con inpainting en: {rect}")
-            
-        except Exception as e:
-            logger.error(f"Error en inpainting: {e}")
-            # Fallback al método simple
-            page.draw_rect(logo_data['rect'], color=(1, 1, 1), fill=(1, 1, 1))
+        return removed_count
     
     def process_pdf(self, input_path: str, output_path: str, 
                    confidence_threshold: float = 0.5,
                    remove_text_blocks_flag: bool = True,
                    text_keywords: List[str] = None) -> Dict:
         """
-        Procesa un PDF usando todas las técnicas avanzadas.
-        
-        Args:
-            input_path: Ruta del PDF de entrada
-            output_path: Ruta del PDF de salida
-            confidence_threshold: Umbral de confianza para considerar como logo
-            remove_text_blocks_flag: Si True, elimina bloques de texto específicos
-            text_keywords: Palabras clave para eliminar bloques de texto
-            
-        Returns:
-            Estadísticas del procesamiento
+        Procesa un PDF completo eliminando logos y texto específico.
         """
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"El archivo {input_path} no existe")
@@ -768,35 +1069,31 @@ class AdvancedPDFLogoRemover:
         stats = {
             'total_pages': 0,
             'total_images': 0,
-            'logos_detected_ml': 0,
-            'logos_detected_ocr': 0,
+            'logos_detected': 0,
             'logos_removed': 0,
             'text_blocks_removed': 0,
             'processing_details': []
         }
         
         try:
+            logger.info(f"FILE Abriendo PDF: {input_path}")
             doc = fitz.open(input_path)
             stats['total_pages'] = len(doc)
             
-            logger.info(f"Procesando PDF con técnicas avanzadas: {input_path}")
-            
-            # Paso 1: Eliminar bloques de texto específicos si está habilitado
+            # Paso 1: Eliminar bloques de texto
             if remove_text_blocks_flag:
-                temp_path = input_path + "_temp.pdf"
-                text_blocks_removed = remove_text_blocks(input_path, temp_path, text_keywords)
-                stats['text_blocks_removed'] = text_blocks_removed
-                
-                # Reabrir el PDF temporal para continuar con el procesamiento
-                doc.close()
-                doc = fitz.open(temp_path)
+                logger.info("CLEAN Eliminando bloques de texto específicos...")
+                keywords = text_keywords or TEXT_BLOCKS_TO_REMOVE
+                text_removed = self.remove_text_blocks(doc, keywords)
+                stats['text_blocks_removed'] = text_removed
             
             # Paso 2: Procesar imágenes y logos
+            logger.info("SEARCH Analizando imágenes y logos...")
+            
             for page_num in range(len(doc)):
                 page = doc[page_num]
-                logger.info(f"Procesando página {page_num + 1}")
+                logger.info(f"PAGE Procesando página {page_num + 1}/{len(doc)}")
                 
-                # Análisis avanzado de imágenes
                 analyzed_images = self.extract_and_analyze_images(page)
                 stats['total_images'] += len(analyzed_images)
                 
@@ -806,158 +1103,540 @@ class AdvancedPDFLogoRemover:
                     'logos_found': []
                 }
                 
-                # Procesar logos detectados
+                # Eliminar logos detectados con validación adicional
                 for img_data in analyzed_images:
-                    ml_pred = img_data['ml_prediction']
-                    ocr_analysis = img_data['ocr_analysis']
                     final_pred = img_data['final_prediction']
                     
-                    # Contabilizar detecciones
-                    if ml_pred['is_logo']:
-                        stats['logos_detected_ml'] += 1
-                    if ocr_analysis['is_logo_text']:
-                        stats['logos_detected_ocr'] += 1
+                    if final_pred['is_logo']:
+                        stats['logos_detected'] += 1
                     
-                    # Eliminar si supera el umbral
-                    if final_pred['combined_score'] >= confidence_threshold:
-                        self.remove_logo_with_inpainting(page, img_data)
-                        stats['logos_removed'] += 1
+                    # Validaciones con prioridad en similitud con datos de entrenamiento
+                    should_remove = False
+                    similarity_conf = img_data.get('similarity_prediction', {}).get('confidence', 0)
+                    similarity_strong = similarity_conf > 0.7
+                    
+                    # REGLA 1: Si la similitud es muy alta (>0.8), eliminar directamente
+                    if similarity_conf > 0.8:
+                        should_remove = True
+                        logger.info(f"OK Eliminación directa por alta similitud: {similarity_conf:.3f}")
+                    
+                    # REGLA 2: Si la similitud dice claramente que NO es logo (<0.3), no eliminar
+                    elif similarity_conf < 0.3:
+                        should_remove = False
+                        logger.info(f"INFO No eliminar por baja similitud: {similarity_conf:.3f}")
+                    
+                    # REGLA 3: Para casos intermedios, aplicar validaciones tradicionales
+                    elif final_pred['combined_score'] >= confidence_threshold:
+                        # Validación de tamaño
+                        img_size = img_data.get('size', (0, 0))
+                        size_ok = 20 <= min(img_size) <= 800  # Rango más amplio
                         
-                        page_details['logos_found'].append({
-                            'ml_confidence': ml_pred['confidence'],
-                            'has_logo_text': ocr_analysis['is_logo_text'],
-                            'text_detected': ocr_analysis['text_content'],
-                            'final_score': final_pred['combined_score']
-                        })
+                        # Validaciones de confianza
+                        ml_strong = img_data['ml_prediction']['confidence'] > 0.6
+                        heur_strong = img_data['heuristic_prediction']['confidence'] > 0.5
+                        ocr_strong = 'logo' in img_data['ocr_analysis'].get('text_content', '').lower()
+                        
+                        has_strong_indicator = similarity_strong or ml_strong or heur_strong or ocr_strong
+                        should_remove = size_ok and has_strong_indicator
+                        
+                        if should_remove:
+                            img_size = img_data.get('size', (0, 0))
+                            logger.info(f"OK Eliminando logo validado: score={final_pred['combined_score']:.3f}, "
+                                      f"size={img_size}, Simil={similarity_conf:.3f}")
+                        else:
+                            img_size = img_data.get('size', (0, 0))
+                            logger.info(f"WARN Logo detectado pero no validado: score={final_pred['combined_score']:.3f}, "
+                                      f"size={img_size}, similitud={similarity_conf:.3f}")
+                    
+                    if should_remove:
+                        success = self.remove_logo_advanced(page, img_data)
+                        if success:
+                            stats['logos_removed'] += 1
+                            
+                            page_details['logos_found'].append({
+                                'ml_confidence': img_data['ml_prediction']['confidence'],
+                                'heuristic_confidence': img_data['heuristic_prediction']['confidence'],
+                                'similarity_confidence': img_data.get('similarity_prediction', {}).get('confidence', 0),
+                                'has_logo_text': img_data['ocr_analysis'].get('is_logo_text', False),
+                                'text_detected': img_data['ocr_analysis'].get('text_content', '')[:50],
+                                'final_score': final_pred['combined_score'],
+                                'rect': img_data['rect']
+                            })
                 
                 stats['processing_details'].append(page_details)
             
             # Guardar PDF procesado
+            logger.info(f"SAVE Guardando PDF procesado: {output_path}")
             doc.save(output_path)
             doc.close()
             
-            # Limpiar archivo temporal si se creó
-            if remove_text_blocks_flag and os.path.exists(temp_path):
-                os.remove(temp_path)
-            
-            logger.info(f"Procesamiento completado. PDF guardado en: {output_path}")
+            logger.info("OK Procesamiento completado exitosamente")
             
         except Exception as e:
-            logger.error(f"Error procesando PDF: {e}")
+            logger.error(f"ERROR Error procesando PDF: {e}")
+            raise
+        
+        return stats
+    
+    def process_pdf_batch(self, input_dir: str = "pdf", output_dir: str = "pdfModificado",
+                         confidence_threshold: float = 0.5,
+                         remove_text_blocks_flag: bool = True,
+                         text_keywords: List[str] = None) -> Dict:
+        """
+        Procesa todos los PDFs de una carpeta y los guarda en otra carpeta.
+        """
+        input_path = Path(input_dir)
+        output_path = Path(output_dir)
+        
+        # Crear directorio de salida si no existe
+        if not output_path.exists():
+            output_path.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Directorio de salida creado: {output_path}")
+        
+        # Buscar todos los archivos PDF
+        pdf_files = list(input_path.glob("*.pdf"))
+        
+        if not pdf_files:
+            logger.warning(f"No se encontraron archivos PDF en {input_path}")
+            return {
+                'total_files': 0,
+                'processed_files': 0,
+                'failed_files': 0,
+                'files_details': []
+            }
+        
+        logger.info(f"Encontrados {len(pdf_files)} archivos PDF para procesar")
+        
+        batch_stats = {
+            'total_files': len(pdf_files),
+            'processed_files': 0,
+            'failed_files': 0,
+            'files_details': []
+        }
+        
+        for i, pdf_file in enumerate(pdf_files, 1):
+            try:
+                # Crear ruta de salida con el mismo nombre
+                output_file = output_path / pdf_file.name
+                
+                logger.info(f"\n{'='*60}")
+                logger.info(f"PROCESANDO ARCHIVO {i}/{len(pdf_files)}: {pdf_file.name}")
+                logger.info(f"{'='*60}")
+                
+                # Procesar el PDF individual
+                file_stats = self.process_pdf(
+                    str(pdf_file),
+                    str(output_file),
+                    confidence_threshold=confidence_threshold,
+                    remove_text_blocks_flag=remove_text_blocks_flag,
+                    text_keywords=text_keywords
+                )
+                
+                file_stats['input_file'] = str(pdf_file)
+                file_stats['output_file'] = str(output_file)
+                file_stats['status'] = 'success'
+                
+                batch_stats['files_details'].append(file_stats)
+                batch_stats['processed_files'] += 1
+                
+                logger.info(f"OK Archivo procesado exitosamente: {pdf_file.name}")
+                
+            except Exception as e:
+                logger.error(f"ERROR Error procesando {pdf_file.name}: {e}")
+                
+                file_stats = {
+                    'input_file': str(pdf_file),
+                    'output_file': str(output_path / pdf_file.name),
+                    'status': 'failed',
+                    'error': str(e),
+                    'total_pages': 0,
+                    'total_images': 0,
+                    'logos_detected': 0,
+                    'logos_removed': 0,
+                    'text_blocks_removed': 0
+                }
+                
+                batch_stats['files_details'].append(file_stats)
+                batch_stats['failed_files'] += 1
+        
+        return batch_stats
+    
+    def extract_candidates(self, input_path: str, output_dir: str) -> Dict:
+        """
+        Extrae todas las imágenes de un PDF y las clasifica como candidatos.
+        """
+        if not os.path.exists(input_path):
+            raise FileNotFoundError(f"El archivo {input_path} no existe")
+        
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        stats = {
+            'total_pages': 0,
+            'total_images': 0,
+            'logo_candidates': 0,
+            'no_logo_candidates': 0,
+            'extracted_files': []
+        }
+        
+        logger.info(f"Extrayendo candidatos de: {input_path}")
+        logger.info(f"Carpeta de salida: {output_dir}")
+        
+        try:
+            doc = fitz.open(input_path)
+            stats['total_pages'] = len(doc)
+            
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                logger.info(f"Procesando página {page_num + 1}/{len(doc)}")
+                
+                analyzed_images = self.extract_and_analyze_images(page)
+                stats['total_images'] += len(analyzed_images)
+                
+                for img_index, img_data in enumerate(analyzed_images):
+                    try:
+                        # Usar nuestro sistema de clasificación avanzado
+                        final_pred = img_data['final_prediction']
+                        similarity_conf = img_data.get('similarity_prediction', {}).get('confidence', 0)
+                        
+                        # Clasificación mejorada
+                        if similarity_conf > 0.7:
+                            label = "logo_candidate"
+                            confidence = similarity_conf
+                            stats['logo_candidates'] += 1
+                        elif final_pred['is_logo'] and final_pred['combined_score'] > 0.6:
+                            label = "logo_candidate"
+                            confidence = final_pred['combined_score']
+                            stats['logo_candidates'] += 1
+                        else:
+                            label = "no_logo_candidate"
+                            confidence = 1 - final_pred['combined_score']
+                            stats['no_logo_candidates'] += 1
+                        
+                        # Crear nombre de archivo informativo
+                        filename = f"page{page_num+1}_img{img_index}_{label}_{confidence:.2f}.png"
+                        save_path = output_path / filename
+                        
+                        # Guardar imagen
+                        image_array = img_data['image']
+                        if len(image_array.shape) == 3:
+                            pil_image = Image.fromarray(image_array)
+                        else:
+                            pil_image = Image.fromarray(image_array).convert('RGB')
+                        
+                        pil_image.save(str(save_path))
+                        
+                        # Guardar información del archivo
+                        file_info = {
+                            'filename': filename,
+                            'page': page_num + 1,
+                            'image_index': img_index,
+                            'classification': label,
+                            'confidence': confidence,
+                            'size': img_data['size'],
+                            'ml_confidence': img_data['ml_prediction']['confidence'],
+                            'similarity_confidence': similarity_conf,
+                            'has_text': img_data['ocr_analysis'].get('has_text', False),
+                            'text_content': img_data['ocr_analysis'].get('text_content', '')[:50]
+                        }
+                        
+                        stats['extracted_files'].append(file_info)
+                        
+                        logger.debug(f"Extraido: {filename} - {label} ({confidence:.3f})")
+                        
+                    except Exception as e:
+                        logger.error(f"Error guardando imagen {img_index} de página {page_num + 1}: {e}")
+                        continue
+            
+            doc.close()
+            
+            # Crear reporte JSON
+            report_path = output_path / "extraction_report.json"
+            with open(report_path, 'w', encoding='utf-8') as f:
+                json.dump(stats, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"Extracción completada: {stats['total_images']} imágenes")
+            logger.info(f"Candidatos a logo: {stats['logo_candidates']}")
+            logger.info(f"No logos: {stats['no_logo_candidates']}")
+            logger.info(f"Reporte guardado: {report_path}")
+            
+        except Exception as e:
+            logger.error(f"Error extrayendo candidatos: {e}")
             raise
         
         return stats
 
 def main():
-    """Función principal para demostrar el uso del sistema avanzado."""
+    """Función principal mejorada."""
     
-    print("=== SISTEMA AVANZADO DE ELIMINACIÓN DE LOGOS Y TEXTO ===\n")
+    parser = argparse.ArgumentParser(description="Sistema avanzado de eliminación de logos y texto")
+    parser.add_argument("--input", "-i", default="input.pdf", help="Archivo PDF de entrada (ignorado si se usa --batch)")
+    parser.add_argument("--output", "-o", default="output_clean.pdf", help="Archivo PDF de salida (ignorado si se usa --batch)")
+    parser.add_argument("--batch", "-b", action="store_true", help="Procesar todos los PDFs de la carpeta 'pdf'")
+    parser.add_argument("--input_dir", default="pdf", help="Carpeta de entrada para procesamiento en lote")
+    parser.add_argument("--output_dir", default="pdfModificado", help="Carpeta de salida para procesamiento en lote")
+    parser.add_argument("--train_data", "-t", default="training_data", help="Directorio con datos de entrenamiento")
+    parser.add_argument("--confidence", "-c", type=float, default=0.5, help="Umbral de confianza (0.0-1.0)")
+    parser.add_argument("--no_text", action="store_true", help="No eliminar bloques de texto")
+    parser.add_argument("--train", action="store_true", help="Entrenar modelo antes de procesar")
+    parser.add_argument("--epochs", type=int, default=10, help="Épocas de entrenamiento")
+    parser.add_argument("--extract-candidates", action="store_true", help="Extraer imágenes candidatas en lugar de procesar PDF")
+    parser.add_argument("--candidates_dir", default="candidates", help="Carpeta donde guardar candidatos extraídos")
     
-    # Configuración
-    input_file = "tiqets.pdf"
-    output_file = "documento_procesado.pdf"
-    training_data_dir = "API_LOGOS_PDF"  # Directorio con datos de entrenamiento
+    args = parser.parse_args()
     
-    # Palabras clave personalizadas para eliminar texto
-    custom_text_keywords = [
-        "Ayuda y soporte",
-        "¿Tienes alguna pregunta",
-        "support.tiqets.com",
-        "estrictamente personal",
-        "contacto",
-        "soporte técnico",
-        "Está prohibido hacer cambios en este ticket "
-    ]
-
-    print(f"Buscando archivo: {input_file}")
+    print("=" * 60)
+    if getattr(args, 'extract_candidates', False):
+        print("EXTRACCION DE CANDIDATOS - CLASIFICACION DE IMAGENES")
+    elif args.batch:
+        print("PROCESAMIENTO EN LOTE - ELIMINACION DE LOGOS Y TEXTO")
+    else:
+        print("SISTEMA AVANZADO DE ELIMINACION DE LOGOS Y TEXTO")
+    print("=" * 60)
     
-    if not os.path.exists(input_file):
-        print(f"❌ Error: No se encontró el archivo {input_file}")
-        print("   Asegúrate de que el archivo existe en el directorio actual")
-        return
+    # Verificar modo de procesamiento
+    if getattr(args, 'extract_candidates', False):
+        # Modo extracción de candidatos
+        if not os.path.exists(args.input):
+            print(f"ERROR: No se encontró el archivo {args.input}")
+            print("TIP Tip: Usa --input para especificar la ruta del PDF")
+            return
+        
+        print(f"FILE Archivo de entrada: {args.input}")
+        print(f"FOLDER Carpeta de candidatos: {args.candidates_dir}")
+    elif args.batch:
+        # Verificar carpeta de entrada
+        if not os.path.exists(args.input_dir):
+            print(f"ERROR: No se encontró la carpeta {args.input_dir}")
+            print("TIP Tip: Crea una carpeta 'pdf' con los archivos PDF a procesar")
+            return
+        
+        print(f"FOLDER Carpeta de entrada: {args.input_dir}")
+        print(f"FOLDER Carpeta de salida: {args.output_dir}")
+        print(f"INFO Umbral de confianza: {args.confidence}")
+    else:
+        # Verificar archivo de entrada
+        if not os.path.exists(args.input):
+            print(f"ERROR: No se encontró el archivo {args.input}")
+            print("TIP Tip: Usa --input para especificar la ruta correcta o --batch para procesar en lote")
+            return
+        
+        print(f"FILE Archivo de entrada: {args.input}")
+        print(f"FILE Archivo de salida: {args.output}")
+        print(f"INFO Umbral de confianza: {args.confidence}")
     
-    # Crear instancia del sistema avanzado
+    # Crear instancia del sistema
     remover = AdvancedPDFLogoRemover()
     
-    # Paso 1: Entrenar modelo (opcional, solo si tienes datos)
-    if os.path.exists(training_data_dir):
-        print("1. Entrenando modelo de detección de logos...")
+    # Entrenar modelo si se solicita
+    if args.train and os.path.exists(args.train_data):
+        print(f"\nTRAIN Entrenando modelo con datos de {args.train_data}...")
         try:
-            remover.train_model(training_data_dir, epochs=5, batch_size=16)
-            print("   ✅ Modelo entrenado exitosamente\n")
+            remover.train_model(args.train_data, epochs=args.epochs)
+            print("OK Modelo entrenado exitosamente")
         except Exception as e:
-            print(f"   ⚠️  Error en entrenamiento: {e}")
-            print("   Continuando con detección heurística\n")
-    else:
-        print("1. No se encontraron datos de entrenamiento.")
-        print("   Usando detección heurística como alternativa\n")
+            print(f"WARN Error en entrenamiento: {e}")
+            print("INFO Continuando sin modelo ML...")
+    elif args.train:
+        print(f"WARN No se encontró directorio de entrenamiento: {args.train_data}")
     
-    # Paso 2: Procesar PDF con eliminación de texto y logos
-    print("2. Procesando PDF con eliminación de texto y logos...")
+    # Palabras clave personalizadas
+    custom_keywords = [
+        "Ayuda y soporte", "¿Tienes alguna pregunta", "support.tiqets.com",
+        "estrictamente personal", "contacto", "soporte técnico",
+        "copyright","all rights reserved", "marca registrada"
+    ]
+    
+    # Procesar PDF(s) o extraer candidatos
     try:
+        if getattr(args, 'extract_candidates', False):
+            # Extracción de candidatos
+            print(f"\nEXTRACT Extrayendo candidatos...")
+            stats = remover.extract_candidates(
+                input_path=args.input,
+                output_dir=args.candidates_dir
+            )
+        else:
+            # Ajustar umbral basándose en si hay modelo ML
+            effective_threshold = args.confidence
+            if remover.model is None:
+                logger.info("Sin modelo ML, usando umbral conservador")
+                effective_threshold = max(args.confidence, 0.6)
+            
+            if args.batch:
+                # Procesamiento en lote
+                print(f"\nPROCESS Procesando PDFs en lote...")
+                stats = remover.process_pdf_batch(
+                    input_dir=args.input_dir,
+                    output_dir=args.output_dir,
+                    confidence_threshold=effective_threshold,
+                    remove_text_blocks_flag=not args.no_text,
+                    text_keywords=custom_keywords
+                )
+            else:
+                # Procesamiento individual
+                print(f"\nPROCESS Procesando PDF...")
+                stats = remover.process_pdf(
+                    args.input,
+                    args.output,
+                    confidence_threshold=effective_threshold,
+                    remove_text_blocks_flag=not args.no_text,
+                    text_keywords=custom_keywords
+                )
+        
+        # Mostrar resultados
+        print("\n" + "=" * 50)
+        if getattr(args, 'extract_candidates', False):
+            print("STATS RESULTADOS DE LA EXTRACCION")
+        else:
+            print("STATS RESULTADOS DEL PROCESAMIENTO")
+        print("=" * 50)
+        
+        if getattr(args, 'extract_candidates', False):
+            # Resultados de extracción de candidatos
+            print(f"PAGE Páginas procesadas: {stats['total_pages']}")
+            print(f"IMAGE Imágenes extraídas: {stats['total_images']}")
+            print(f"LOGO Candidatos a logo: {stats['logo_candidates']}")
+            print(f"NO-LOGO Candidatos descartados: {stats['no_logo_candidates']}")
+            print(f"SAVE Imágenes guardadas en: {args.candidates_dir}")
+            
+            # Mostrar algunos ejemplos de candidatos a logo
+            logo_files = [f for f in stats['extracted_files'] if 'logo_candidate' in f['classification']]
+            if logo_files:
+                print(f"\nDETAILS CANDIDATOS A LOGO ENCONTRADOS:")
+                for i, file_info in enumerate(logo_files[:5]):  # Mostrar solo los primeros 5
+                    print(f"  CANDIDATE {i+1}: {file_info['filename']}")
+                    print(f"    - Confianza: {file_info['confidence']:.3f}")
+                    print(f"    - Similitud: {file_info['similarity_confidence']:.3f}")
+                    print(f"    - Tamaño: {file_info['size']}")
+                    if file_info['has_text']:
+                        print(f"    - Texto: '{file_info['text_content']}...'")
+                if len(logo_files) > 5:
+                    print(f"  ... y {len(logo_files) - 5} candidatos más")
+        elif args.batch:
+            # Resultados de procesamiento en lote
+            print(f"FILES Archivos encontrados: {stats['total_files']}")
+            print(f"OK Archivos procesados exitosamente: {stats['processed_files']}")
+            print(f"ERROR Archivos con errores: {stats['failed_files']}")
+            
+            # Estadísticas totales
+            total_pages = sum(f.get('total_pages', 0) for f in stats['files_details'])
+            total_text_removed = sum(f.get('text_blocks_removed', 0) for f in stats['files_details'])
+            total_images = sum(f.get('total_images', 0) for f in stats['files_details'])
+            total_logos_detected = sum(f.get('logos_detected', 0) for f in stats['files_details'])
+            total_logos_removed = sum(f.get('logos_removed', 0) for f in stats['files_details'])
+            
+            print(f"PAGE Total páginas procesadas: {total_pages}")
+            print(f"CLEAN Total bloques de texto eliminados: {total_text_removed}")
+            print(f"IMAGE Total imágenes analizadas: {total_images}")
+            print(f"INFO Total logos detectados: {total_logos_detected}")
+            print(f"REMOVE Total logos eliminados: {total_logos_removed}")
+            print(f"SAVE Archivos guardados en: {args.output_dir}")
+            
+            # Mostrar detalles por archivo
+            successful_files = [f for f in stats['files_details'] if f['status'] == 'success']
+            files_with_logos = [f for f in successful_files if f.get('logos_removed', 0) > 0]
+            
+            if files_with_logos:
+                print(f"\nDETAILS ARCHIVOS CON LOGOS ELIMINADOS:")
+                for file_detail in files_with_logos:
+                    print(f"FILE {Path(file_detail['input_file']).name}: {file_detail['logos_removed']} logos eliminados")
+            
+            # Mostrar archivos con errores
+            failed_files = [f for f in stats['files_details'] if f['status'] == 'failed']
+            if failed_files:
+                print(f"\nERRORS ARCHIVOS CON ERRORES:")
+                for file_detail in failed_files:
+                    print(f"ERROR {Path(file_detail['input_file']).name}: {file_detail['error']}")
+        else:
+            # Resultados de procesamiento individual
+            print(f"PAGE Páginas procesadas: {stats['total_pages']}")
+            print(f"CLEAN Bloques de texto eliminados: {stats['text_blocks_removed']}")
+            print(f"IMAGE Imágenes analizadas: {stats['total_images']}")
+            print(f"INFO Logos detectados: {stats['logos_detected']}")
+            print(f"REMOVE Logos eliminados: {stats['logos_removed']}")
+            print(f"SAVE Archivo generado: {args.output}")
+            
+            # Detalles por página (modo individual)
+            if any(page_detail['logos_found'] for page_detail in stats['processing_details']):
+                print(f"\nDETAILS DETALLES POR PÁGINA:")
+                for page_detail in stats['processing_details']:
+                    if page_detail['logos_found']:
+                        print(f"\nPAGE Página {page_detail['page_number']}:")
+                        for i, logo in enumerate(page_detail['logos_found']):
+                            print(f"  LOGO Logo {i+1}:")
+                            print(f"    - Confianza ML: {logo['ml_confidence']:.3f}")
+                            print(f"    - Confianza heurística: {logo['heuristic_confidence']:.3f}")
+                            print(f"    - Similitud con ejemplos: {logo.get('similarity_confidence', 0):.3f}")
+                            print(f"    - Contiene texto: {'Sí' if logo['has_logo_text'] else 'No'}")
+                            if logo['text_detected']:
+                                print(f"    - Texto: '{logo['text_detected']}...'")
+                            print(f"    - Puntuación final: {logo['final_score']:.3f}")
+        
+        if getattr(args, 'extract_candidates', False):
+            print(f"\nOK ¡Extracción completada exitosamente!")
+            print(f"INFO Las imágenes candidatas se guardaron en: {args.candidates_dir}/")
+            print(f"INFO Reporte detallado: {args.candidates_dir}/extraction_report.json")
+        else:
+            print(f"\nOK ¡Procesamiento completado exitosamente!")
+            if args.batch:
+                print(f"INFO Los archivos procesados se guardaron en: {args.output_dir}/")
+            else:
+                print(f"INFO El archivo limpio se guardó como: {args.output}")
+        
+    except Exception as e:
+        print(f"\nERROR Error durante el procesamiento: {e}")
+        if args.batch:
+            print("TIP Revisa que la carpeta 'pdf' exista y contenga archivos PDF válidos")
+        else:
+            print("TIP Revisa que el archivo PDF no esté corrupto o protegido")
+
+def simple_demo():
+    """Demostración simple para casos básicos."""
+    print("DEMO MODO DEMOSTRACIÓN SIMPLE")
+    
+    # Archivos de ejemplo
+    input_files = ["input.pdf", "document.pdf", "test.pdf", "tiqets.pdf"]
+    input_file = None
+    
+    for file in input_files:
+        if os.path.exists(file):
+            input_file = file
+            break
+    
+    if input_file is None:
+        print("ERROR No se encontró ningún archivo PDF para procesar")
+        print("TIP Coloca un archivo PDF llamado 'input.pdf' en este directorio")
+        return
+    
+    output_file = f"clean_{input_file}"
+    
+    print(f"FILE Procesando: {input_file}")
+    print(f"FILE Resultado: {output_file}")
+    
+    try:
+        remover = AdvancedPDFLogoRemover()
         stats = remover.process_pdf(
-            input_file, 
-            output_file, 
-            confidence_threshold=0.4,  # Umbral más estricto
-            remove_text_blocks_flag=True,  # Habilitar eliminación de texto
-            text_keywords=custom_text_keywords  # Usar palabras clave personalizadas
+            input_file,
+            output_file,
+            confidence_threshold=0.3,  # Más permisivo
+            remove_text_blocks_flag=True
         )
         
-        print("   ✅ PDF procesado exitosamente\n")
+        print(f"OK ¡Listo! Se eliminaron:")
+        print(f"   - {stats['text_blocks_removed']} bloques de texto")
+        print(f"   - {stats['logos_removed']} logos de {stats['logos_detected']} detectados")
+        print(f"SAVE Archivo guardado: {output_file}")
         
-        # Mostrar estadísticas detalladas
-        print("=== ESTADÍSTICAS DETALLADAS ===")
-        print(f"Páginas procesadas: {stats['total_pages']}")
-        print(f"Bloques de texto eliminados: {stats['text_blocks_removed']}")
-        print(f"Imágenes analizadas: {stats['total_images']}")
-        print(f"Logos detectados por ML: {stats['logos_detected_ml']}")
-        print(f"Logos detectados por OCR: {stats['logos_detected_ocr']}")
-        print(f"Logos eliminados: {stats['logos_removed']}")
-        print(f"Archivo generado: {output_file}\n")
-        
-        # Detalles por página
-        for page_detail in stats['processing_details']:
-            if page_detail['logos_found']:
-                print(f"Página {page_detail['page_number']}:")
-                for i, logo in enumerate(page_detail['logos_found']):
-                    print(f"  Logo {i+1}:")
-                    print(f"    - Confianza ML: {logo['ml_confidence']:.3f}")
-                    print(f"    - Texto detectado: {logo['text_detected'][:50]}...")
-                    print(f"    - Puntuación final: {logo['final_score']:.3f}")
-        
-    except FileNotFoundError:
-        print(f"   ❌ Error: No se encontró el archivo {input_file}")
-        print("   Asegúrate de que el archivo existe")
     except Exception as e:
-        print(f"   ❌ Error durante el procesamiento: {e}")
-
-def simple_text_remover(input_pdf: str, output_pdf: str, keywords: List[str] = None):
-    """
-    Función simplificada para solo eliminar bloques de texto específicos.
-    
-    Args:
-        input_pdf: Ruta del PDF de entrada
-        output_pdf: Ruta del PDF de salida  
-        keywords: Lista de palabras clave a eliminar
-    """
-    if keywords is None:
-        keywords = TEXT_BLOCKS_TO_REMOVE
-    
-    print(f"=== ELIMINADOR SIMPLE DE TEXTO ===")
-    print(f"Procesando: {input_pdf}")
-    print(f"Palabras clave: {keywords}")
-    
-    try:
-        removed_count = remove_text_blocks(input_pdf, output_pdf, keywords)
-        print(f"✅ Proceso completado")
-        print(f"✅ Eliminados {removed_count} bloques de texto")
-        print(f"✅ Archivo guardado: {output_pdf}")
-    except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"ERROR Error: {e}")
 
 if __name__ == "__main__":
-    # Opción 1: Usar el sistema completo (logos + texto)
-    main()
+    import sys
     
-    # Opción 2: Solo eliminar texto (descomenta para usar)
-    # simple_text_remover("tiqets.pdf", "tiqets_sin_contacto.pdf")
+    if len(sys.argv) == 1:
+        # Si no hay argumentos, usar modo simple
+        simple_demo()
+    else:
+        # Si hay argumentos, usar modo avanzado
+        main()
