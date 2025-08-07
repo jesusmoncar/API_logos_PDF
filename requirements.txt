@@ -1,0 +1,12 @@
+torch
+torchvision
+torchaudio
+opencv-python
+PyMuPDF
+Pillow
+numpy
+scikit-learn
+scipy
+scikit-image
+easyocr
+anthropic
