@@ -1594,7 +1594,7 @@ class AdvancedPDFLogoRemover:
         
         return stats
     
-    def process_pdf_batch(self, input_dir: str = "pdf", output_dir: str = "pdfModificado",
+    def process_pdf_batch(self, input_dir: str = "input", output_dir: str = "outputModificado",
                          confidence_threshold: float = 0.5,
                          remove_text_blocks_flag: bool = True,
                          remove_links_flag: bool = True,
@@ -1833,8 +1833,8 @@ def main():
     parser.add_argument("--input", "-i", default="input.pdf", help="Archivo PDF de entrada (ignorado si se usa --batch)")
     parser.add_argument("--output", "-o", default="output_clean.pdf", help="Archivo PDF de salida (ignorado si se usa --batch)")
     parser.add_argument("--batch", "-b", action="store_true", help="Procesar todos los PDFs de la carpeta 'pdf'")
-    parser.add_argument("--input_dir", default="pdf", help="Carpeta de entrada para procesamiento en lote")
-    parser.add_argument("--output_dir", default="pdfModificado", help="Carpeta de salida para procesamiento en lote")
+    parser.add_argument("--input_dir", default="input", help="Carpeta de entrada para procesamiento en lote")
+    parser.add_argument("--output_dir", default="outputModificado", help="Carpeta de salida para procesamiento en lote")
     parser.add_argument("--train_data", "-t", default="training_data", help="Directorio con datos de entrenamiento")
     parser.add_argument("--confidence", "-c", type=float, default=0.5, help="Umbral de confianza (0.0-1.0)")
     parser.add_argument("--no_text", action="store_true", help="No eliminar bloques de texto")
