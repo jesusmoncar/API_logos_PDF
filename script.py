@@ -1220,13 +1220,14 @@ class AdvancedPDFLogoRemover:
             train_dataset = LogoDataset(train_paths, train_labels, self.transform)
             val_dataset = LogoDataset(val_paths, val_labels, self.transform)
             
-            # Data loaders
-            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+            # Data loaders (pin_memory=False para evitar warning cuando no hay GPU)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            pin_memory = torch.cuda.is_available()
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=pin_memory)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=pin_memory)
             
             # Modelo
             self.model = LogoDetectorCNN(num_classes=2)
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.model.to(device)
             logger.info(f"Usando dispositivo: {device}")
             
@@ -1441,6 +1442,11 @@ class AdvancedPDFLogoRemover:
         """
         Procesa un PDF completo eliminando logos y texto específico.
         """
+        import time
+        
+        # Iniciar medición de tiempo
+        start_time = time.time()
+        
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"El archivo {input_path} no existe")
         
@@ -1453,10 +1459,17 @@ class AdvancedPDFLogoRemover:
             'links_removed': 0,
             'link_annotations_removed': 0,
             'link_text_removed': 0,
-            'processing_details': []
+            'processing_details': [],
+            'processing_time_seconds': 0.0
         }
         
         try:
+            # Obtener solo el nombre del archivo para mostrar
+            pdf_name = os.path.basename(input_path)
+            
+            logger.info(f"\n{'='*80}")
+            logger.info(f"🔄 INICIANDO PROCESAMIENTO: {pdf_name}")
+            logger.info(f"{'='*80}")
             logger.info(f"FILE Abriendo PDF: {input_path}")
             doc = fitz.open(input_path)
             stats['total_pages'] = len(doc)
@@ -1559,11 +1572,25 @@ class AdvancedPDFLogoRemover:
             doc.save(output_path)
             doc.close()
             
-            logger.info("OK Procesamiento completado exitosamente")
+            logger.info(f"✅ COMPLETADO: {pdf_name}")
+            logger.info(f"{'='*80}\n")
             
         except Exception as e:
             logger.error(f"ERROR Error procesando PDF: {e}")
             raise
+        finally:
+            # Calcular tiempo de procesamiento
+            end_time = time.time()
+            processing_time = end_time - start_time
+            stats['processing_time_seconds'] = round(processing_time, 2)
+            
+            # Log del tiempo de procesamiento
+            minutes = int(processing_time // 60)
+            seconds = processing_time % 60
+            if minutes > 0:
+                logger.info(f"TIME Tiempo de procesamiento: {minutes}m {seconds:.2f}s ({processing_time:.2f}s total)")
+            else:
+                logger.info(f"TIME Tiempo de procesamiento: {processing_time:.2f}s")
         
         return stats
     
@@ -1576,6 +1603,11 @@ class AdvancedPDFLogoRemover:
         """
         Procesa todos los PDFs de una carpeta y los guarda en otra carpeta.
         """
+        import time
+        
+        # Iniciar medición de tiempo total
+        batch_start_time = time.time()
+        
         input_path = Path(input_dir)
         output_path = Path(output_dir)
         
@@ -1596,13 +1628,21 @@ class AdvancedPDFLogoRemover:
                 'files_details': []
             }
         
-        logger.info(f"Encontrados {len(pdf_files)} archivos PDF para procesar")
+        logger.info(f"\n{'#'*80}")
+        logger.info(f"🚀 INICIANDO PROCESAMIENTO EN LOTE")
+        logger.info(f"{'#'*80}")
+        logger.info(f"📂 Directorio de entrada: {input_path}")
+        logger.info(f"📂 Directorio de salida: {output_path}")
+        logger.info(f"📄 Archivos encontrados: {len(pdf_files)} PDFs")
+        logger.info(f"{'#'*80}\n")
         
         batch_stats = {
             'total_files': len(pdf_files),
             'processed_files': 0,
             'failed_files': 0,
-            'files_details': []
+            'files_details': [],
+            'total_processing_time_seconds': 0.0,
+            'average_time_per_file': 0.0
         }
         
         for i, pdf_file in enumerate(pdf_files, 1):
@@ -1610,9 +1650,9 @@ class AdvancedPDFLogoRemover:
                 # Crear ruta de salida con el mismo nombre
                 output_file = output_path / pdf_file.name
                 
-                logger.info(f"\n{'='*60}")
-                logger.info(f"PROCESANDO ARCHIVO {i}/{len(pdf_files)}: {pdf_file.name}")
-                logger.info(f"{'='*60}")
+                logger.info(f"\n{'='*80}")
+                logger.info(f"🔄 PROCESANDO ARCHIVO {i}/{len(pdf_files)}: {pdf_file.name}")
+                logger.info(f"{'='*80}")
                 
                 # Procesar el PDF individual
                 file_stats = self.process_pdf(
@@ -1632,7 +1672,8 @@ class AdvancedPDFLogoRemover:
                 batch_stats['files_details'].append(file_stats)
                 batch_stats['processed_files'] += 1
                 
-                logger.info(f"OK Archivo procesado exitosamente: {pdf_file.name}")
+                logger.info(f"✅ ARCHIVO COMPLETADO: {pdf_file.name}")
+                logger.info(f"{'='*80}\n")
                 
             except Exception as e:
                 logger.error(f"ERROR Error procesando {pdf_file.name}: {e}")
@@ -1651,6 +1692,32 @@ class AdvancedPDFLogoRemover:
                 
                 batch_stats['files_details'].append(file_stats)
                 batch_stats['failed_files'] += 1
+        
+        # Calcular tiempo total de procesamiento
+        batch_end_time = time.time()
+        total_processing_time = batch_end_time - batch_start_time
+        batch_stats['total_processing_time_seconds'] = round(total_processing_time, 2)
+        
+        # Calcular tiempo promedio por archivo procesado
+        if batch_stats['processed_files'] > 0:
+            batch_stats['average_time_per_file'] = round(total_processing_time / batch_stats['processed_files'], 2)
+        
+        # Log del tiempo total de procesamiento
+        minutes = int(total_processing_time // 60)
+        seconds = total_processing_time % 60
+        logger.info(f"\n{'#'*80}")
+        logger.info(f"📊 RESUMEN FINAL DEL PROCESAMIENTO EN LOTE")
+        logger.info(f"{'#'*80}")
+        if minutes > 0:
+            logger.info(f"⏱️  Tiempo total: {minutes}m {seconds:.2f}s ({total_processing_time:.2f}s)")
+        else:
+            logger.info(f"⏱️  Tiempo total: {total_processing_time:.2f}s")
+        logger.info(f"📁 Archivos procesados: {batch_stats['processed_files']}/{batch_stats['total_files']}")
+        if batch_stats['failed_files'] > 0:
+            logger.info(f"❌ Archivos fallidos: {batch_stats['failed_files']}")
+        if batch_stats['processed_files'] > 0:
+            logger.info(f"📈 Tiempo promedio por archivo: {batch_stats['average_time_per_file']:.2f}s")
+        logger.info(f"{'#'*80}\n")
         
         return batch_stats
     

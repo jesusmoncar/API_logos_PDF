@@ -22,13 +22,17 @@ dataset = datasets.ImageFolder(data_dir, transform=transform)
 
 # División en train/val
 train_idx, val_idx = train_test_split(list(range(len(dataset))), test_size=0.2, stratify=dataset.targets)
-train_loader = DataLoader(Subset(dataset, train_idx), batch_size=batch_size, shuffle=True)
-val_loader = DataLoader(Subset(dataset, val_idx), batch_size=batch_size)
+
+# Configurar pin_memory según disponibilidad de GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+pin_memory = torch.cuda.is_available()
+
+train_loader = DataLoader(Subset(dataset, train_idx), batch_size=batch_size, shuffle=True, pin_memory=pin_memory)
+val_loader = DataLoader(Subset(dataset, val_idx), batch_size=batch_size, pin_memory=pin_memory)
 
 # Modelo
 model = models.resnet18(pretrained=True)
 model.fc = nn.Linear(model.fc.in_features, 2)  # 2 clases: logo / no_logo
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
 # Entrenamiento
